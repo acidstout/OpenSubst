@@ -37,7 +37,7 @@
 #include <strsafe.h>
 
 #define APP_NAME        L"OpenSubst"
-#define APP_VERSION     L"1.0.0"
+#define APP_VERSION     L"1.0.1"
 #define APP_REGKEY      L"Software\\OpenSubst"
 #define APP_WNDCLASS    L"OpenSubst.MainWindow"
 #define APP_MUTEX       L"Local\\OpenSubst.SingleInstance"

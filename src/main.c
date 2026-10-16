@@ -7,7 +7,9 @@
  *   OpenSubst                      open the window
  *   OpenSubst X: path [label] ...  create a drive (like SUBST / NET USE)
  *   OpenSubst X: /D                remove a drive
- *   OpenSubst /LIST                list drives
+ *   OpenSubst /LINK link target    create a folder link
+ *   OpenSubst /UNLINK link         remove a folder link
+ *   OpenSubst /LIST                list drives and folder links
  *   OpenSubst /STARTUP             autostart: restore stored drives
  *   OpenSubst /REGTASK|/UNREGTASK  (elevated) register/remove the UAC task
  *   OpenSubst /UACTASK <payload>   (elevated, from the task) run drive ops
@@ -19,6 +21,7 @@
 #include "drives.h"
 #include "engine.h"
 #include "uac.h"
+#include "links.h"
 #include "ui.h"
 
 HINSTANCE   g_hinst;
@@ -138,6 +141,8 @@ typedef struct Cli {
     const wchar_t *icon;
     const wchar_t *exportFile;
     const wchar_t *payload;
+    const wchar_t *linkPath, *linkTarget;
+    BOOL link, unlink;
     BOOL remove, nosave, nocreate, uac, nouac, recycle, autorestore;
     BOOL startup, nowelcome, list, help, regtask, unregtask, uactask, elevatedRun, bad;
 } Cli;
@@ -172,6 +177,15 @@ static void parse_cli(int argc, wchar_t **argv, Cli *c)
             else if (is_switch(a, L"UACTASK")) { c->uactask = TRUE; c->payload = i + 1 < argc ? argv[++i] : L""; }
             else if (is_switch(a, L"ELEVATED")) { c->elevatedRun = TRUE; c->payload = i + 1 < argc ? argv[++i] : L""; }
             else if (is_switch(a, L"EXPORTLANG") && i + 1 < argc) c->exportFile = argv[++i];
+            else if (is_switch(a, L"LINK") && i + 2 < argc && !c->link && !c->unlink) {
+                c->link = TRUE;
+                c->linkPath = argv[++i];
+                c->linkTarget = argv[++i];
+            }
+            else if (is_switch(a, L"UNLINK") && i + 1 < argc && !c->link && !c->unlink) {
+                c->unlink = TRUE;
+                c->linkPath = argv[++i];
+            }
             else c->bad = TRUE;
             continue;
         }
@@ -225,7 +239,77 @@ static int cli_list(void)
         out_text(line);
         n++;
     }
+    for (i = 0; i < MAX_LINKS; i++) {
+        const LinkConfig *c = &g_links[i];
+        wchar_t line[2 * PATHBUF + 64];
+        const wchar_t *state;
+        LinkState st;
+        if (!c->used) continue;
+        Link_Query(c->link, &st);
+        if ((st.kind == LK_JUNCTION || st.kind == LK_SYMLINK) && lstrcmpiW(st.target, c->target) == 0)
+            state = st.kind == LK_SYMLINK ? L"symbolic link" : L"junction";
+        else if (!(c->flags & DF_ENABLED))
+            state = L"disabled";
+        else
+            state = st.kind == LK_NONE ? L"not created" : L"path in use";
+        StringCchPrintfW(line, ARRAYSIZE(line), L"%s => %s  [%s]\r\n", c->link, c->target, state);
+        out_text(line);
+    }
     return 0;
+}
+
+static int cli_link(const Cli *a)
+{
+    wchar_t link[PATHBUF];
+    LinkConfig nc;
+    int i = -1;
+    DWORD r;
+
+    /* A link already stored at this path is re-pointed, not duplicated. */
+    if (Link_ResolveLocation(a->linkPath, link, ARRAYSIZE(link))) i = Links_Find(link);
+    if (Links_CheckInput(i, a->linkPath, a->linkTarget, &nc, NULL)) return 1;
+    if (i < 0) i = Links_FreeSlot();
+    r = Links_Set(i, &nc, NULL, TRUE, !a->nocreate);
+    if (r == 0 && !a->nosave) Links_Save(i);
+    return r ? 1 : 0;
+}
+
+static int cli_unlink(const Cli *a)
+{
+    wchar_t link[PATHBUF];
+    int i;
+    DWORD r;
+
+    if (!Link_ResolveLocation(a->linkPath, link, ARRAYSIZE(link))) {
+        App_Message(NULL, T(S_E_LK_PATH), TRUE);
+        return 1;
+    }
+    i = Links_Find(link);
+    if (i >= 0) {
+        /* Removes the link only if it is still ours; /NOSAVE keeps it stored. */
+        r = Links_Unapply(i, NULL, TRUE);
+        if (r == 0 && !a->nosave) {
+            Links_Delete(i);
+            ZeroMemory(&g_links[i], sizeof(g_links[i]));
+        }
+        return r ? 1 : 0;
+    }
+    {
+        /* Not stored: a link all the same may go. Link_Remove refuses real
+           folders and files. */
+        LinkState st;
+        Link_Query(link, &st);
+        r = st.kind == LK_NONE ? ERROR_PATH_NOT_FOUND : Link_Remove(link);
+        if (r) {
+            wchar_t head[PATHBUF + 256], etext[512], line[640], msg[PATHBUF + 1024];
+            StringCchPrintfW(head, ARRAYSIZE(head), T(S_E_LK_REMOVE), link);
+            Error_Text(r, etext, ARRAYSIZE(etext));
+            StringCchPrintfW(line, ARRAYSIZE(line), T(S_E_ERRCODE), r, etext);
+            StringCchPrintfW(msg, ARRAYSIZE(msg), L"%s\r\n\r\n%s", head, line);
+            App_Message(NULL, msg, TRUE);
+        }
+        return r ? 1 : 0;
+    }
 }
 
 static int cli_remove(const Cli *a)
@@ -362,6 +446,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdLine, int nShow)
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     Config_LoadAll();
+    Links_LoadAll();
 
     if (cli.exportFile) {
         attach_console();
@@ -370,7 +455,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdLine, int nShow)
         if (!rc) App_Message(NULL, cli.exportFile, FALSE);
         goto done;
     }
-    if (cli.help || cli.bad || (cli.path && !cli.letter) || (cli.letter && !cli.path && !cli.remove)) {
+    if (cli.help || cli.bad || (cli.path && !cli.letter) || (cli.letter && !cli.path && !cli.remove) ||
+        ((cli.link || cli.unlink) && (cli.letter || cli.remove || cli.list))) {
         attach_console();
         if (s_console) {
             App_Message(NULL, T(S_CLI_USAGE), FALSE);
@@ -388,6 +474,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdLine, int nShow)
     if (cli.letter) {
         attach_console();
         rc = cli.remove ? cli_remove(&cli) : cli_add(&cli);
+        notify_running_instance();
+        goto done;
+    }
+    if (cli.link || cli.unlink) {
+        attach_console();
+        rc = cli.link ? cli_link(&cli) : cli_unlink(&cli);
         notify_running_instance();
         goto done;
     }

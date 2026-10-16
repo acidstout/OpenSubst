@@ -29,6 +29,7 @@
 #include "recycle.h"
 #include "theme.h"
 #include "gfx.h"
+#include "links.h"
 #include "resource.h"
 
 /* ---- control ids ---- */
@@ -48,6 +49,7 @@ enum {
     IDM_O_STARTUP, IDM_O_BACKGROUND, IDM_O_MANAGENET, IDM_O_ONLYOURS,
     IDM_D_OPEN, IDM_D_OPENPATH, IDM_D_ENABLED, IDM_D_UAC, IDM_D_RECYCLE, IDM_D_AUTO,
     IDM_D_MANAGE, IDM_D_REMOVE, IDM_T_SHOWHIDE,
+    IDM_LINK_NEW, IDM_LINK_EDIT, IDM_L_OPENTARGET,
     IDM_LANG_FILE = 1200,       /* + index */
     IDM_T_DRIVE = 1300          /* + letter index */
 };
@@ -60,22 +62,30 @@ enum {
 #define TIMER_RESTORE   2
 #define TIMER_SOON      3
 
-enum { ROW_GROUP, ROW_DRIVE, ROW_EMPTY };
+enum { ROW_GROUP, ROW_DRIVE, ROW_LINK, ROW_EMPTY };
 enum { PART_NONE, PART_TOGGLE, PART_REMOVE };
 
 typedef struct Row {
     int        type;
     wchar_t    letter;
+    int        link;            /* ROW_LINK: index into g_links */
     BOOL       managed;
     BOOL       network;
-    BOOL       pathMissing;
+    BOOL       pathMissing;     /* folder of the drive, target of the link */
     DriveState st;
+    LinkState  lst;
     HICON      icon;            /* owned if ownIcon */
     BOOL       ownIcon;
     StrId      groupName;
 } Row;
 
-#define MAX_ROWS 64
+#define MAX_ROWS (26 + MAX_LINKS + 4)
+
+/* Row clicks are posted as one LPARAM: a drive letter, or a link index. */
+#define LINK_KEY(i)     ((LPARAM)0x10000 + (i))
+#define IS_LINK_KEY(k)  ((k) >= LINK_KEY(0) && (k) < LINK_KEY(MAX_LINKS))
+#define KEY_LINK(k)     ((int)((k) - LINK_KEY(0)))
+#define IS_ITEM_ROW(t)  ((t) == ROW_DRIVE || (t) == ROW_LINK)
 
 static HWND   s_wnd, s_list, s_path, s_pathBtn, s_icon, s_iconBtn, s_letter, s_label;
 static HWND   s_tog[3], s_mount, s_lbl[3], s_tip;
@@ -84,7 +94,7 @@ static BOOL   s_haveGlyphFont;
 static int    s_dpi = 96;
 static HMENU  s_menu;
 static HACCEL s_accel;
-static HICON  s_icoApp, s_icoAppSmall, s_icoFixed, s_icoNet;
+static HICON  s_icoApp, s_icoAppSmall, s_icoFixed, s_icoNet, s_icoFolder;
 static UINT   s_msgTaskbarCreated, s_msgShowMe, s_msgRefresh;
 static BOOL   s_startup, s_noWelcome, s_exitWhenIdle, s_trayAdded, s_tempTray;
 static BOOL   s_afterShowPosted;   /* start-up questions asked once, on first show */
@@ -95,6 +105,7 @@ static DWORD  s_signature;
 static Row    s_rows[MAX_ROWS];
 static int    s_nrows;
 static wchar_t s_selLetter;
+static int    s_selLink = -1;       /* selected link row, or -1 */
 static int    s_hotRow = -1, s_hotPart = PART_NONE;
 
 static LangFile s_langs[32];
@@ -349,8 +360,10 @@ static void load_icons(void)
 {
     if (s_icoFixed) DestroyIcon(s_icoFixed);
     if (s_icoNet) DestroyIcon(s_icoNet);
+    if (s_icoFolder) DestroyIcon(s_icoFolder);
     s_icoFixed = load_stock_icon(SIID_DRIVEFIXED, S(32));
     s_icoNet = load_stock_icon(SIID_DRIVENET, S(32));
+    s_icoFolder = load_stock_icon(SIID_FOLDER, S(32));
 }
 
 /* ============================================================
@@ -396,6 +409,8 @@ static void build_menus(void)
     int i;
 
     AppendMenuW(cmd, MF_STRING, IDM_REFRESH, T(S_M_REFRESH));
+    AppendMenuW(cmd, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(cmd, MF_STRING, IDM_LINK_NEW, T(S_M_LINK_NEW));
     AppendMenuW(cmd, MF_SEPARATOR, 0, NULL);
     AppendMenuW(cmd, MF_STRING, IDM_ENABLEALL, T(S_M_ENABLEALL));
     AppendMenuW(cmd, MF_STRING, IDM_DISABLEALL, T(S_M_DISABLEALL));
@@ -499,6 +514,18 @@ static int managed_count(void)
     int i, n = 0;
     for (i = 0; i < 26; i++) if (g_cfg[i].used) n++;
     return n;
+}
+
+static int link_count(void)
+{
+    int i, n = 0;
+    for (i = 0; i < MAX_LINKS; i++) if (g_links[i].used) n++;
+    return n;
+}
+
+static BOOL link_is_ours(const LinkConfig *c, const LinkState *st)
+{
+    return (st->kind == LK_JUNCTION || st->kind == LK_SYMLINK) && lstrcmpiW(st->target, c->target) == 0;
 }
 
 static void tray_fill(NOTIFYICONDATAW *nid)
@@ -622,6 +649,23 @@ static void add_drive_row(wchar_t letter, BOOL managed, BOOL net, const DriveSta
     if (!r->icon) r->icon = net ? s_icoNet : s_icoFixed;
 }
 
+static void add_link_row(int i, const LinkState *st)
+{
+    Row *r;
+    const LinkConfig *c = &g_links[i];
+    if (s_nrows >= MAX_ROWS) return;
+    r = &s_rows[s_nrows++];
+    ZeroMemory(r, sizeof(*r));
+    r->type = ROW_LINK;
+    r->link = i;
+    r->managed = TRUE;
+    r->network = Path_IsUnc(c->target);
+    r->lst = *st;
+    if ((c->flags & DF_ENABLED) && st->kind == LK_NONE)
+        r->pathMissing = !Path_IsDirectoryTimeout(c->target, DIR_TIMEOUT_UI);
+    r->icon = s_icoFolder ? s_icoFolder : s_icoFixed;
+}
+
 static void add_group_row(StrId name)
 {
     Row *r;
@@ -632,11 +676,13 @@ static void add_group_row(StrId name)
     r->groupName = name;
 }
 
-/* Hash of the drive state of all letters. 'states' may be NULL; a DriveState
-   is 4 KB, so the 26 of them live in a static buffer, not on the stack. */
-static DWORD compute_signature(DriveState *states)
+/* Hash of the drive state of all letters and of all stored links. 'states'
+   and 'links' may be NULL; a DriveState or LinkState is 4 KB, so they live
+   in static buffers, not on the stack. */
+static DWORD compute_signature(DriveState *states, LinkState *links)
 {
     static DriveState scratch;
+    static LinkState lscratch;
     DWORD h = 2166136261u;
     int i;
     for (i = 0; i < 26; i++) {
@@ -646,6 +692,14 @@ static DWORD compute_signature(DriveState *states)
         h = (h ^ (DWORD)st->kind) * 16777619u;
         for (p = st->target; *p; p++) h = (h ^ (DWORD)*p) * 16777619u;
         h = (h ^ (DWORD)Engine_IsPending((wchar_t)(L'A' + i))) * 16777619u;
+    }
+    for (i = 0; i < MAX_LINKS; i++) {
+        const wchar_t *p;
+        LinkState *st = links ? &links[i] : &lscratch;
+        if (!g_links[i].used) continue;
+        Link_Query(g_links[i].link, st);
+        h = (h ^ (DWORD)(st->kind + 16 * i)) * 16777619u;
+        for (p = st->target; *p; p++) h = (h ^ (DWORD)*p) * 16777619u;
     }
     return h;
 }
@@ -712,11 +766,12 @@ static wchar_t combo_letter(void)
 static void rebuild_list(void)
 {
     static DriveState states[26];
+    static LinkState lstates[MAX_LINKS];
     BOOL group = (g_set.flags & AF_GROUP) != 0;
-    int pass, i, top, selIdx = -1;
+    int pass, i, top, selIdx = -1, keepLink = s_selLink;
     wchar_t keepSel = s_selLetter;
 
-    s_signature = compute_signature(states);
+    s_signature = compute_signature(states, lstates);
     top = (int)SendMessageW(s_list, LB_GETTOPINDEX, 0, 0);
     free_rows();
 
@@ -743,6 +798,12 @@ static void rebuild_list(void)
             add_drive_row((wchar_t)(L'A' + i), managed, net, st);
         }
     }
+    /* Folder links are no drives: always a group of their own, last. */
+    if (link_count()) {
+        add_group_row(S_GRP_LINKS);
+        for (i = 0; i < MAX_LINKS; i++)
+            if (g_links[i].used) add_link_row(i, &lstates[i]);
+    }
     if (s_nrows == 0) {
         s_rows[0].type = ROW_EMPTY;
         s_rows[0].icon = NULL;
@@ -754,9 +815,11 @@ static void rebuild_list(void)
     SendMessageW(s_list, LB_RESETCONTENT, 0, 0);
     for (i = 0; i < s_nrows; i++) {
         SendMessageW(s_list, LB_ADDSTRING, 0, (LPARAM)i);
-        if (s_rows[i].type == ROW_DRIVE && s_rows[i].letter == keepSel) selIdx = i;
+        if (s_rows[i].type == ROW_DRIVE && keepSel && s_rows[i].letter == keepSel) selIdx = i;
+        if (s_rows[i].type == ROW_LINK && keepLink >= 0 && s_rows[i].link == keepLink) selIdx = i;
     }
-    s_selLetter = selIdx >= 0 ? keepSel : 0;
+    s_selLetter = (selIdx >= 0 && s_rows[selIdx].type == ROW_DRIVE) ? keepSel : 0;
+    s_selLink = (selIdx >= 0 && s_rows[selIdx].type == ROW_LINK) ? keepLink : -1;
     SendMessageW(s_list, LB_SETCURSEL, (WPARAM)selIdx, 0);
     SendMessageW(s_list, LB_SETTOPINDEX, (WPARAM)top, 0);
     SendMessageW(s_list, WM_SETREDRAW, TRUE, 0);
@@ -866,6 +929,28 @@ static void row_status(const Row *r, wchar_t *out, size_t cch, BOOL *err)
         StringCchPrintfW(out, cch, L"%s  \x2014  %s", T(S_ST_NOTMOUNTED), c->path);
 }
 
+static void link_status(const Row *r, wchar_t *out, size_t cch, BOOL *err)
+{
+    const LinkConfig *c = &g_links[r->link];
+    *err = FALSE;
+    if (link_is_ours(c, &r->lst)) {
+        StringCchPrintfW(out, cch, L"%s  \x2014  %s",
+                         T(r->lst.kind == LK_SYMLINK ? S_ST_LK_SYMLINK : S_ST_LK_JUNCTION), c->target);
+        return;
+    }
+    if (!(c->flags & DF_ENABLED)) {
+        StringCchCopyW(out, cch, c->target);
+        return;
+    }
+    *err = TRUE;
+    if (r->lst.kind != LK_NONE)
+        StringCchPrintfW(out, cch, L"%s  \x2014  %s", T(S_ST_LK_OCCUPIED), c->target);
+    else if (r->pathMissing)
+        StringCchPrintfW(out, cch, L"%s  \x2014  %s", T(S_ST_LK_TARGETGONE), c->target);
+    else
+        StringCchPrintfW(out, cch, L"%s  \x2014  %s", T(S_ST_LK_NOTCREATED), c->target);
+}
+
 static void draw_row(const DRAWITEMSTRUCT *di)
 {
     const Row *r;
@@ -880,8 +965,8 @@ static void draw_row(const DRAWITEMSTRUCT *di)
 
     if (index < 0 || index >= s_nrows || w <= 0 || h <= 0) return;
     r = &s_rows[index];
-    sel = (di->itemState & ODS_SELECTED) && r->type == ROW_DRIVE;
-    hot = (index == s_hotRow) && r->type == ROW_DRIVE;
+    sel = (di->itemState & ODS_SELECTED) && IS_ITEM_ROW(r->type);
+    hot = (index == s_hotRow) && IS_ITEM_ROW(r->type);
 
     mem = CreateCompatibleDC(dc);
     bmp = CreateCompatibleBitmap(dc, w, h);
@@ -912,14 +997,27 @@ static void draw_row(const DRAWITEMSTRUCT *di)
         DrawTextW(mem, T(S_ST_EMPTY), -1, &t, DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
         SelectObject(mem, of);
     } else {
-        const DriveConfig *c = &g_cfg[LETTER_INDEX(r->letter)];
+        /* Drive rows have a DriveConfig; link rows a LinkConfig. */
+        const DriveConfig *c = r->type == ROW_DRIVE ? &g_cfg[LETTER_INDEX(r->letter)] : NULL;
+        const LinkConfig *lc = r->type == ROW_LINK ? &g_links[r->link] : NULL;
         RECT tog, rem, local = tr, t1, t2;
-        wchar_t title[LABELBUF + 32], status[PATHBUF + 128];
-        BOOL err, on = r->managed ? (c->flags & DF_ENABLED) != 0 : TRUE;
-        BOOL mounted = r->managed ? is_mounted(c, &r->st) : TRUE;
+        wchar_t title[PATHBUF + 32], status[PATHBUF + 128];
+        BOOL err, on, mounted;
         int isz = S(32), ix = S(12), iy = (h - isz) / 2;
         int textL = ix + isz + S(12);
         HFONT of;
+
+        if (lc) {
+            on = (lc->flags & DF_ENABLED) != 0;
+            mounted = link_is_ours(lc, &r->lst);
+            StringCchCopyW(title, ARRAYSIZE(title), lc->link);
+            link_status(r, status, ARRAYSIZE(status), &err);
+        } else {
+            on = r->managed ? (c->flags & DF_ENABLED) != 0 : TRUE;
+            mounted = r->managed ? is_mounted(c, &r->st) : TRUE;
+            row_title(r, title, ARRAYSIZE(title));
+            row_status(r, status, ARRAYSIZE(status), &err);
+        }
 
         Gfx_FillRoundRect(g, (float)S(4), (float)S(2), (float)(w - S(8)), (float)(h - S(4)),
                           (float)S(6), bg, 255);
@@ -936,9 +1034,6 @@ static void draw_row(const DRAWITEMSTRUCT *di)
         draw_toggle(g, &tog, on, hot && s_hotPart == PART_TOGGLE, TRUE);
         draw_remove(g, &rem, hot && s_hotPart == PART_REMOVE, bg);
 
-        row_title(r, title, ARRAYSIZE(title));
-        row_status(r, status, ARRAYSIZE(status), &err);
-
         t1.left = textL;
         t1.right = tog.left - S(8);
         t1.top = h / 2 - S(18);
@@ -952,9 +1047,10 @@ static void draw_row(const DRAWITEMSTRUCT *di)
         {
             /* Title, followed by small glyphs for UAC / Recycle Bin / Auto-Restore. */
             RECT calc = t1;
-            DrawTextW(mem, title, -1, &t1, DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            DrawTextW(mem, title, -1, &t1, DT_LEFT | DT_BOTTOM | DT_SINGLELINE |
+                      (lc ? DT_PATH_ELLIPSIS : DT_END_ELLIPSIS) | DT_NOPREFIX);
             DrawTextW(mem, title, -1, &calc, DT_LEFT | DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX);
-            if (r->managed && s_haveGlyphFont) {
+            if (c && r->managed && s_haveGlyphFont) {
                 static const wchar_t glyphs[3] = { 0xEA18, 0xE74D, 0xE895 };
                 int gx = calc.right + S(8), k;
                 SelectObject(mem, s_fontGlyph);
@@ -1071,10 +1167,15 @@ static void update_mount_caption(void)
 static void update_editor_for_letter(void)
 {
     int sel = (int)SendMessageW(s_list, LB_GETCURSEL, 0, 0);
-    if (sel >= 0 && sel < s_nrows && s_rows[sel].type == ROW_DRIVE) {
+    if (sel >= 0 && sel < s_nrows && s_rows[sel].type == ROW_LINK) {
+        /* The editor below is for drives only: keep what it shows. */
+        s_selLetter = 0;
+        s_selLink = s_rows[sel].link;
+    } else if (sel >= 0 && sel < s_nrows && s_rows[sel].type == ROW_DRIVE) {
         const Row *r = &s_rows[sel];
         const DriveConfig *c = &g_cfg[LETTER_INDEX(r->letter)];
         s_selLetter = r->letter;
+        s_selLink = -1;
         if (r->managed) {
             SetWindowTextW(s_path, c->path);
             SetWindowTextW(s_label, c->label);
@@ -1238,36 +1339,122 @@ static void on_mount(void)
     rebuild_list();
 }
 
-static void browse_folder(void)
+/* Checks the folder the user confirms in the picker. FALSE keeps the picker
+   open; the check reports why itself. */
+typedef BOOL (*PickCheck)(HWND owner, const wchar_t *folder);
+
+/* IFileDialogEvents with OnFileOk only. Lives on the stack of pick_folder,
+   which unadvises it before returning, so the reference count is moot. */
+typedef struct PickEvents {
+    IFileDialogEvents iface;
+    PickCheck check;
+} PickEvents;
+
+static HRESULT STDMETHODCALLTYPE pe_QueryInterface(IFileDialogEvents *This, REFIID riid, void **ppv)
+{
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IFileDialogEvents)) {
+        *ppv = This;
+        return S_OK;
+    }
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE pe_AddRef(IFileDialogEvents *This)  { (void)This; return 2; }
+static ULONG STDMETHODCALLTYPE pe_Release(IFileDialogEvents *This) { (void)This; return 1; }
+
+static HRESULT STDMETHODCALLTYPE pe_OnFileOk(IFileDialogEvents *This, IFileDialog *fd)
+{
+    PickEvents *pe = (PickEvents *)This;
+    IShellItem *item = NULL;
+    IOleWindow *ow = NULL;
+    HWND hwnd = NULL;
+    wchar_t *p = NULL;
+    BOOL ok = TRUE;
+    if (FAILED(IFileDialog_GetResult(fd, &item))) return S_OK;
+    if (SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &p)) && p) {
+        if (SUCCEEDED(IFileDialog_QueryInterface(fd, &IID_IOleWindow, (void **)&ow))) {
+            IOleWindow_GetWindow(ow, &hwnd);
+            IOleWindow_Release(ow);
+        }
+        ok = pe->check(hwnd, p);
+        CoTaskMemFree(p);
+    }
+    IShellItem_Release(item);
+    return ok ? S_OK : S_FALSE;
+}
+static HRESULT STDMETHODCALLTYPE pe_OnFolderChanging(IFileDialogEvents *This, IFileDialog *fd, IShellItem *si)
+{ (void)This; (void)fd; (void)si; return S_OK; }
+static HRESULT STDMETHODCALLTYPE pe_OnFolderChange(IFileDialogEvents *This, IFileDialog *fd)
+{ (void)This; (void)fd; return S_OK; }
+static HRESULT STDMETHODCALLTYPE pe_OnSelectionChange(IFileDialogEvents *This, IFileDialog *fd)
+{ (void)This; (void)fd; return S_OK; }
+static HRESULT STDMETHODCALLTYPE pe_OnShareViolation(IFileDialogEvents *This, IFileDialog *fd, IShellItem *si,
+                                                     FDE_SHAREVIOLATION_RESPONSE *r)
+{ (void)This; (void)fd; (void)si; (void)r; return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE pe_OnTypeChange(IFileDialogEvents *This, IFileDialog *fd)
+{ (void)This; (void)fd; return S_OK; }
+static HRESULT STDMETHODCALLTYPE pe_OnOverwrite(IFileDialogEvents *This, IFileDialog *fd, IShellItem *si,
+                                                FDE_OVERWRITE_RESPONSE *r)
+{ (void)This; (void)fd; (void)si; (void)r; return E_NOTIMPL; }
+
+static IFileDialogEventsVtbl s_pickEventsVtbl = {
+    pe_QueryInterface, pe_AddRef, pe_Release, pe_OnFileOk, pe_OnFolderChanging, pe_OnFolderChange,
+    pe_OnSelectionChange, pe_OnShareViolation, pe_OnTypeChange, pe_OnOverwrite
+};
+
+/* Folder picker. 'title' may be NULL (the shell's default), 'start' empty,
+   'check' NULL (any folder). */
+static BOOL pick_folder_ex(HWND owner, const wchar_t *title, const wchar_t *start, PickCheck check,
+                           wchar_t *out, size_t cch)
 {
     IFileOpenDialog *dlg = NULL;
     HRESULT hr = CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER,
                                   &IID_IFileOpenDialog, (void **)&dlg);
-    wchar_t cur[PATHBUF];
-    get_text(s_path, cur, ARRAYSIZE(cur));
+    BOOL ok = FALSE;
     if (SUCCEEDED(hr)) {
-        DWORD opts = 0;
+        DWORD opts = 0, cookie = 0;
+        BOOL advised = FALSE;
+        PickEvents events;
         IShellItem *item = NULL;
+        if (check) {
+            events.iface.lpVtbl = &s_pickEventsVtbl;
+            events.check = check;
+            advised = SUCCEEDED(IFileOpenDialog_Advise(dlg, &events.iface, &cookie));
+        }
         IFileOpenDialog_GetOptions(dlg, &opts);
         IFileOpenDialog_SetOptions(dlg, opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-        IFileOpenDialog_SetTitle(dlg, T(S_BROWSE_TITLE));
-        if (cur[0] && Path_IsDirectoryTimeout(cur, DIR_TIMEOUT_USER) &&
-            SUCCEEDED(SHCreateItemFromParsingName(cur, NULL, &IID_IShellItem, (void **)&item))) {
+        if (title) IFileOpenDialog_SetTitle(dlg, title);
+        if (start && start[0] && Path_IsDirectoryTimeout(start, DIR_TIMEOUT_USER) &&
+            SUCCEEDED(SHCreateItemFromParsingName(start, NULL, &IID_IShellItem, (void **)&item))) {
             IFileOpenDialog_SetFolder(dlg, item);
             IShellItem_Release(item);
             item = NULL;
         }
-        if (SUCCEEDED(IFileOpenDialog_Show(dlg, s_wnd)) &&
+        if (SUCCEEDED(IFileOpenDialog_Show(dlg, owner)) &&
             SUCCEEDED(IFileOpenDialog_GetResult(dlg, &item))) {
             wchar_t *p = NULL;
             if (SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &p)) && p) {
-                SetWindowTextW(s_path, p);
+                ok = SUCCEEDED(StringCchCopyW(out, cch, p));
                 CoTaskMemFree(p);
             }
             IShellItem_Release(item);
         }
+        if (advised) IFileOpenDialog_Unadvise(dlg, cookie);
         IFileOpenDialog_Release(dlg);
     }
+    return ok;
+}
+
+static BOOL pick_folder(HWND owner, const wchar_t *title, const wchar_t *start, wchar_t *out, size_t cch)
+{
+    return pick_folder_ex(owner, title, start, NULL, out, cch);
+}
+
+static void browse_folder(void)
+{
+    wchar_t cur[PATHBUF], p[PATHBUF];
+    get_text(s_path, cur, ARRAYSIZE(cur));
+    if (pick_folder(s_wnd, T(S_BROWSE_TITLE), cur, p, ARRAYSIZE(p))) SetWindowTextW(s_path, p);
 }
 
 static void browse_icon(void)
@@ -1411,9 +1598,221 @@ static void after_action(void)
     rebuild_list();
 }
 
-static void row_click(int part, wchar_t letter)
+/* ============================================================
+ *  Folder links (list rows, editor dialog)
+ * ============================================================ */
+
+static BOOL link_valid(int i) { return i >= 0 && i < MAX_LINKS && g_links[i].used; }
+
+static void link_set_enabled(int i, BOOL on)
 {
-    const Row *r = row_for_letter(letter);
+    LinkConfig *c;
+    if (!link_valid(i)) return;
+    c = &g_links[i];
+    if (on) {
+        c->flags |= DF_ENABLED;
+        Links_Save(i);
+        Links_Apply(i, s_wnd, TRUE);
+    } else {
+        /* Still there (failed): keep it marked enabled. */
+        if (Links_Unapply(i, s_wnd, TRUE) != 0) return;
+        c->flags &= ~DF_ENABLED;
+        Links_Save(i);
+    }
+}
+
+static void link_remove(int i)
+{
+    if (!link_valid(i)) return;
+    /* Removes only the link object, and only if it is still ours. */
+    if (Links_Unapply(i, s_wnd, TRUE) != 0) return;
+    Links_Delete(i);
+    ZeroMemory(&g_links[i], sizeof(g_links[i]));
+    if (s_selLink == i) s_selLink = -1;
+}
+
+static void open_link(int i, BOOL target)
+{
+    if (!link_valid(i)) return;
+    open_path(target ? g_links[i].target : g_links[i].link);
+}
+
+static void dlg_text(HWND dlg, int id, wchar_t *out, int cch)
+{
+    get_text(GetDlgItem(dlg, id), out, cch);
+    StrTrimW(out, L" \t");
+}
+
+/* Last component of a folder path, or "" for a root. */
+static void path_leaf(const wchar_t *p, wchar_t *out, size_t cch)
+{
+    wchar_t tmp[PATHBUF];
+    const wchar_t *f;
+    int n;
+    out[0] = 0;
+    if (FAILED(StringCchCopyW(tmp, ARRAYSIZE(tmp), p))) return;
+    n = lstrlenW(tmp);
+    while (n > 0 && tmp[n - 1] == L'\\') tmp[--n] = 0;
+    f = wcsrchr(tmp, L'\\');
+    f = f ? f + 1 : tmp;
+    if (*f && !wcschr(f, L':')) StringCchCopyW(out, cch, f);
+}
+
+/* Picker check for the folder a link goes into: a local volume whose file
+   system can hold junctions and symbolic links. */
+static BOOL link_parent_ok(HWND owner, const wchar_t *folder)
+{
+    wchar_t vol[PATHBUF], msg[PATHBUF + 512];
+    wchar_t root[4] = { folder[0], L':', L'\\', 0 };
+    if (Path_IsUnc(folder) || folder[1] != L':' || GetDriveTypeW(root) == DRIVE_REMOTE) {
+        App_Message(owner, T(S_E_LK_PATH), TRUE);
+        return FALSE;
+    }
+    if (Link_VolumeSupported(folder, vol, ARRAYSIZE(vol))) return TRUE;
+    StringCchPrintfW(msg, ARRAYSIZE(msg), T(S_E_LK_NOREPARSE), vol);
+    App_Message(owner, msg, TRUE);
+    return FALSE;
+}
+
+/* "..." next to the link: pick the folder the link goes into, keep the name
+   typed so far (or suggest the target's name). */
+static void link_browse_parent(HWND dlg)
+{
+    wchar_t cur[PATHBUF], start[PATHBUF], name[PATHBUF], parent[PATHBUF], res[PATHBUF];
+    HWND edit = GetDlgItem(dlg, IDC_LK_LINK);
+    int n;
+
+    dlg_text(dlg, IDC_LK_LINK, cur, ARRAYSIZE(cur));
+    StringCchCopyW(start, ARRAYSIZE(start), cur);
+    if (start[0]) PathRemoveFileSpecW(start);
+    if (!pick_folder_ex(dlg, T(S_LK_BROWSE_PARENT), start, link_parent_ok, parent, ARRAYSIZE(parent)))
+        return;
+
+    path_leaf(cur, name, ARRAYSIZE(name));
+    if (!name[0]) {
+        wchar_t target[PATHBUF];
+        dlg_text(dlg, IDC_LK_TARGET, target, ARRAYSIZE(target));
+        path_leaf(target, name, ARRAYSIZE(name));
+    }
+    StringCchCopyW(res, ARRAYSIZE(res), parent);
+    n = lstrlenW(res);
+    if (n > 0 && res[n - 1] != L'\\') StringCchCatW(res, ARRAYSIZE(res), L"\\");
+    StringCchCatW(res, ARRAYSIZE(res), name);
+    SetWindowTextW(edit, res);
+    SetFocus(edit);
+    SendMessageW(edit, EM_SETSEL, (WPARAM)lstrlenW(res), (LPARAM)lstrlenW(res));
+}
+
+static void link_browse_target(HWND dlg)
+{
+    wchar_t cur[PATHBUF], p[PATHBUF];
+    dlg_text(dlg, IDC_LK_TARGET, cur, ARRAYSIZE(cur));
+    if (pick_folder(dlg, NULL, cur, p, ARRAYSIZE(p))) SetDlgItemTextW(dlg, IDC_LK_TARGET, p);
+}
+
+static void link_dlg_ok(HWND dlg)
+{
+    int slot = (int)GetWindowLongPtrW(dlg, DWLP_USER), i, field;
+    wchar_t link[PATHBUF], target[PATHBUF];
+    LinkConfig nc;
+
+    dlg_text(dlg, IDC_LK_LINK, link, ARRAYSIZE(link));
+    dlg_text(dlg, IDC_LK_TARGET, target, ARRAYSIZE(target));
+    field = Links_CheckInput(slot, link, target, &nc, dlg);
+    if (field) {
+        HWND e = GetDlgItem(dlg, field == 1 ? IDC_LK_LINK : IDC_LK_TARGET);
+        SetFocus(e);
+        SendMessageW(e, EM_SETSEL, 0, -1);
+        return;
+    }
+    i = slot >= 0 ? slot : Links_FreeSlot();
+    /* Not created: the dialog stays open for a correction. */
+    if (Links_Set(i, &nc, dlg, TRUE, TRUE) != 0) return;
+    Links_Save(i);
+    s_selLink = i;
+    s_selLetter = 0;
+    EndDialog(dlg, IDOK);
+}
+
+static INT_PTR CALLBACK link_dlg_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_INITDIALOG: {
+        static const int buttons[] = { IDC_LK_LINKBTN, IDC_LK_TARGETBTN, IDOK, IDCANCEL };
+        int slot = (int)lp, k;
+        SetWindowLongPtrW(dlg, DWLP_USER, (LONG_PTR)slot);
+        SetWindowTextW(dlg, T(S_LK_TITLE));
+        SetDlgItemTextW(dlg, IDC_LK_LBLLINK, T(S_LK_LINK));
+        SetDlgItemTextW(dlg, IDC_LK_LBLTARGET, T(S_LK_TARGET));
+        SetDlgItemTextW(dlg, IDC_LK_HINT, T(S_LK_HINT));
+        SetDlgItemTextW(dlg, IDCANCEL, T(S_BTN_CANCEL));
+        SendDlgItemMessageW(dlg, IDC_LK_LINK, EM_SETCUEBANNER, TRUE, (LPARAM)T(S_LK_CUE_LINK));
+        SendDlgItemMessageW(dlg, IDC_LK_TARGET, EM_SETCUEBANNER, TRUE, (LPARAM)T(S_CUE_PATH));
+        SendDlgItemMessageW(dlg, IDC_LK_LINK, EM_SETLIMITTEXT, PATHBUF - 1, 0);
+        SendDlgItemMessageW(dlg, IDC_LK_TARGET, EM_SETLIMITTEXT, PATHBUF - 1, 0);
+        if (link_valid(slot)) {
+            SetDlgItemTextW(dlg, IDC_LK_LINK, g_links[slot].link);
+            SetDlgItemTextW(dlg, IDC_LK_TARGET, g_links[slot].target);
+        }
+        Theme_ApplyToMainWindow(dlg);
+        Theme_ApplyToEdit(GetDlgItem(dlg, IDC_LK_LINK));
+        Theme_ApplyToEdit(GetDlgItem(dlg, IDC_LK_TARGET));
+        for (k = 0; k < (int)ARRAYSIZE(buttons); k++) Theme_ApplyToButton(GetDlgItem(dlg, buttons[k]));
+        return TRUE;
+    }
+    case WM_CTLCOLORDLG:
+        return (INT_PTR)Theme_BgBrush();
+    case WM_CTLCOLORSTATIC:
+        SetBkMode((HDC)wp, TRANSPARENT);
+        SetBkColor((HDC)wp, Theme_Bg());
+        SetTextColor((HDC)wp, Theme_Text());
+        return (INT_PTR)Theme_BgBrush();
+    case WM_CTLCOLOREDIT:
+        SetTextColor((HDC)wp, Theme_Text());
+        SetBkColor((HDC)wp, Theme_Surface());
+        return (INT_PTR)Theme_SurfaceBrush();
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDC_LK_LINKBTN:   link_browse_parent(dlg); return TRUE;
+        case IDC_LK_TARGETBTN: link_browse_target(dlg); return TRUE;
+        case IDOK:             link_dlg_ok(dlg); return TRUE;
+        case IDCANCEL:         EndDialog(dlg, IDCANCEL); return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+/* Create (slot -1) or edit a folder link. */
+static void link_edit(int slot)
+{
+    if (slot >= 0 && !link_valid(slot)) return;
+    if (slot < 0 && Links_FreeSlot() < 0) {
+        App_Message(s_wnd, T(S_E_LK_FULL), TRUE);
+        return;
+    }
+    DialogBoxParamW(g_hinst, MAKEINTRESOURCEW(IDD_LINK), s_wnd, link_dlg_proc, (LPARAM)slot);
+}
+
+static LPARAM row_key(const Row *r)
+{
+    return r->type == ROW_LINK ? LINK_KEY(r->link) : (LPARAM)r->letter;
+}
+
+static void row_click(int part, LPARAM key)
+{
+    const Row *r;
+    wchar_t letter;
+    if (IS_LINK_KEY(key)) {
+        int i = KEY_LINK(key);
+        if (!link_valid(i)) return;
+        if (part == PART_TOGGLE) link_set_enabled(i, !(g_links[i].flags & DF_ENABLED));
+        else if (part == PART_REMOVE) link_remove(i);
+        after_action();
+        return;
+    }
+    letter = IS_DRIVE_LETTER((wchar_t)key) ? (wchar_t)key : 0;
+    r = row_for_letter(letter);
     if (!r) return;
     if (part == PART_TOGGLE) {
         if (r->managed) drive_set_enabled(letter, !(g_cfg[LETTER_INDEX(letter)].flags & DF_ENABLED));
@@ -1440,7 +1839,7 @@ static void list_context_menu(int x, int y)
 {
     HMENU m = CreatePopupMenu();
     POINT pt;
-    int idx = -1, cmd;
+    int idx = -1, cmd, link = -1;
     wchar_t letter = 0;
     const Row *r = NULL;
 
@@ -1464,14 +1863,26 @@ static void list_context_menu(int x, int y)
         hit = (DWORD)SendMessageW(s_list, LB_ITEMFROMPOINT, 0, MAKELPARAM(cp.x, cp.y));
         if (!HIWORD(hit)) idx = (int)LOWORD(hit);
     }
-    if (idx >= 0 && idx < s_nrows && s_rows[idx].type == ROW_DRIVE) {
+    if (idx >= 0 && idx < s_nrows && IS_ITEM_ROW(s_rows[idx].type)) {
         r = &s_rows[idx];
-        letter = r->letter;
+        if (r->type == ROW_LINK) link = r->link;
+        else letter = r->letter;
         SendMessageW(s_list, LB_SETCURSEL, (WPARAM)idx, 0);
         update_editor_for_letter();
     }
 
-    if (r) {
+    if (r && link >= 0) {
+        const LinkConfig *c = &g_links[link];
+        AppendMenuW(m, MF_STRING | (link_is_ours(c, &r->lst) ? 0 : MF_GRAYED), IDM_D_OPEN, T(S_M_D_OPEN));
+        AppendMenuW(m, MF_STRING, IDM_L_OPENTARGET, T(S_M_L_OPENTARGET));
+        SetMenuDefaultItem(m, IDM_D_OPEN, FALSE);
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(m, MF_STRING, IDM_LINK_EDIT, T(S_M_LINK_EDIT));
+        AppendMenuW(m, MF_STRING | ((c->flags & DF_ENABLED) ? MF_CHECKED : 0), IDM_D_ENABLED, T(S_M_D_ENABLED));
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(m, MF_STRING, IDM_D_REMOVE, T(S_M_D_REMOVE));
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    } else if (r) {
         const DriveConfig *c = &g_cfg[LETTER_INDEX(letter)];
         BOOL mounted = r->managed ? is_mounted(c, &r->st) : TRUE;
         AppendMenuW(m, MF_STRING | (mounted ? 0 : MF_GRAYED), IDM_D_OPEN, T(S_M_D_OPEN));
@@ -1493,6 +1904,8 @@ static void list_context_menu(int x, int y)
         AppendMenuW(m, MF_STRING, IDM_D_REMOVE, T(S_M_D_REMOVE));
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     }
+    AppendMenuW(m, MF_STRING, IDM_LINK_NEW, T(S_M_LINK_NEW));
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_REFRESH, T(S_M_REFRESH));
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_ENABLEALL, T(S_M_ENABLEALL));
@@ -1503,6 +1916,21 @@ static void list_context_menu(int x, int y)
     cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, s_wnd, NULL);
     DestroyMenu(m);
     if (!cmd) return;
+
+    if (link >= 0) {
+        switch (cmd) {
+        case IDM_D_OPEN:       open_link(link, FALSE); return;
+        case IDM_L_OPENTARGET: open_link(link, TRUE); return;
+        case IDM_LINK_EDIT:    link_edit(link); break;
+        case IDM_D_ENABLED:    link_set_enabled(link, !(g_links[link].flags & DF_ENABLED)); break;
+        case IDM_D_REMOVE:     link_remove(link); break;
+        default:
+            PostMessageW(s_wnd, WM_COMMAND, (WPARAM)cmd, 0);
+            return;
+        }
+        after_action();
+        return;
+    }
     if (cmd >= IDM_D_OPEN && cmd <= IDM_D_REMOVE && !letter) return;
 
     switch (cmd) {
@@ -1528,7 +1956,7 @@ static void list_context_menu(int x, int y)
 static int hit_part(int idx, POINT pt)
 {
     RECT ir, tog, rem;
-    if (idx < 0 || idx >= s_nrows || s_rows[idx].type != ROW_DRIVE) return PART_NONE;
+    if (idx < 0 || idx >= s_nrows || !IS_ITEM_ROW(s_rows[idx].type)) return PART_NONE;
     if (SendMessageW(s_list, LB_GETITEMRECT, (WPARAM)idx, (LPARAM)&ir) == LB_ERR) return PART_NONE;
     row_parts(&ir, &tog, &rem);
     InflateRect(&tog, S(3), S(6));
@@ -1600,14 +2028,15 @@ static LRESULT CALLBACK list_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UIN
         part = hit_part(idx, pt);
         if (part != PART_NONE) {
             SetFocus(hwnd);
-            PostMessageW(s_wnd, WM_APP_ROWCLICK, (WPARAM)part, (LPARAM)s_rows[idx].letter);
+            PostMessageW(s_wnd, WM_APP_ROWCLICK, (WPARAM)part, row_key(&s_rows[idx]));
             return 0;
         }
-        if (idx < 0 || HIWORD(hit) || s_rows[idx].type != ROW_DRIVE) {
+        if (idx < 0 || HIWORD(hit) || !IS_ITEM_ROW(s_rows[idx].type)) {
             /* Click on a header or empty space: clear the selection. */
             SetFocus(hwnd);
             SendMessageW(hwnd, LB_SETCURSEL, (WPARAM)-1, 0);
             s_selLetter = 0;
+            s_selLink = -1;
             update_mount_caption();
             return 0;
         }
@@ -1615,13 +2044,13 @@ static LRESULT CALLBACK list_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UIN
     }
     case WM_KEYDOWN: {
         int sel = (int)SendMessageW(hwnd, LB_GETCURSEL, 0, 0);
-        wchar_t letter = (sel >= 0 && sel < s_nrows && s_rows[sel].type == ROW_DRIVE) ? s_rows[sel].letter : 0;
-        if (wp == VK_DELETE && letter) {
-            PostMessageW(s_wnd, WM_APP_ROWCLICK, PART_REMOVE, (LPARAM)letter);
+        BOOL item = sel >= 0 && sel < s_nrows && IS_ITEM_ROW(s_rows[sel].type);
+        if (wp == VK_DELETE && item) {
+            PostMessageW(s_wnd, WM_APP_ROWCLICK, PART_REMOVE, row_key(&s_rows[sel]));
             return 0;
         }
-        if (wp == VK_SPACE && letter) {
-            PostMessageW(s_wnd, WM_APP_ROWCLICK, PART_TOGGLE, (LPARAM)letter);
+        if (wp == VK_SPACE && item) {
+            PostMessageW(s_wnd, WM_APP_ROWCLICK, PART_TOGGLE, row_key(&s_rows[sel]));
             return 0;
         }
         break;
@@ -2078,7 +2507,7 @@ static void after_show(void)
     if ((g_splitToken || g_elevated) && !g_quiet && Uac_TaskPresent() && !Uac_LocationSecure() &&
         ask_yes_no_ex(s_wnd, T(S_Q_INSECURETASK_T), T(S_Q_INSECURETASK), TRUE, TRUE) == IDYES)
         task_command(FALSE);
-    if (!(g_set.flags & AF_WELCOMED) && managed_count() == 0) {
+    if (!(g_set.flags & AF_WELCOMED) && managed_count() == 0 && link_count() == 0) {
         if (!s_noWelcome && !g_quiet) welcome();
         else { g_set.flags |= AF_WELCOMED; Settings_Save(); }
         return;
@@ -2090,10 +2519,12 @@ static void after_show(void)
         Drive_Query(c->letter, &st);
         if (st.kind == DK_NONE || st.kind == DK_NETUNAVAIL) missing++;
     }
-    if (missing && !g_quiet && ask_yes_no(s_wnd, T(S_Q_RESTORE), NULL, FALSE) == IDYES) {
+    /* Folder links live in the file system and survive restarts; one that
+       has gone (deleted by hand) is simply created again. */
+    Links_RestoreAll();
+    if (missing && !g_quiet && ask_yes_no(s_wnd, T(S_Q_RESTORE), NULL, FALSE) == IDYES)
         Engine_RestoreAll(s_wnd, TRUE);
-        rebuild_list();
-    }
+    rebuild_list();
 }
 
 /* ============================================================
@@ -2132,6 +2563,7 @@ static void handle_command(int id, int code, HWND ctl)
     case IDC_MOUNT:
         if (GetFocus() == s_list) {
             if (s_selLetter) open_drive(s_selLetter, FALSE);
+            else if (s_selLink >= 0) open_link(s_selLink, FALSE);
         } else {
             on_mount();
         }
@@ -2160,6 +2592,7 @@ static void handle_command(int id, int code, HWND ctl)
     case IDC_LIST:
         if (code == LBN_SELCHANGE) update_editor_for_letter();
         else if (code == LBN_DBLCLK && s_selLetter) open_drive(s_selLetter, FALSE);
+        else if (code == LBN_DBLCLK && s_selLink >= 0) open_link(s_selLink, FALSE);
         break;
     case IDC_LETTER:
         if (code == CBN_SELCHANGE) update_mount_caption();
@@ -2167,7 +2600,12 @@ static void handle_command(int id, int code, HWND ctl)
 
     case IDM_REFRESH:
         Config_LoadAll();
+        Links_LoadAll();
         rebuild_list();
+        break;
+    case IDM_LINK_NEW:
+        link_edit(-1);
+        after_action();
         break;
     case IDM_ENABLEALL:  all_drives(0); break;
     case IDM_DISABLEALL: all_drives(1); break;
@@ -2306,6 +2744,7 @@ static LRESULT CALLBACK main_proc_inner(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     }
     if (msg == s_msgRefresh && msg) {
         Config_LoadAll();
+        Links_LoadAll();
         rebuild_list();
         return 0;
     }
@@ -2409,7 +2848,7 @@ static LRESULT CALLBACK main_proc_inner(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         return 0;
 
     case WM_APP_ROWCLICK:
-        row_click((int)wp, (wchar_t)lp);
+        row_click((int)wp, lp);
         return 0;
 
     case WM_APP_NETDONE:
@@ -2438,7 +2877,7 @@ static LRESULT CALLBACK main_proc_inner(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     case WM_TIMER:
         if (wp == TIMER_POLL || wp == TIMER_SOON) {
             if (wp == TIMER_SOON) KillTimer(hwnd, TIMER_SOON);
-            if (compute_signature(NULL) != s_signature) rebuild_list();
+            if (compute_signature(NULL, NULL) != s_signature) rebuild_list();
             if (tray_wanted() && ++s_trayProbe % 15 == 0) tray_update();
         } else if (wp == TIMER_RESTORE) {
             if (Engine_AutoRestoreTick(hwnd)) rebuild_list();
@@ -2566,6 +3005,7 @@ BOOL Ui_Create(BOOL startup, BOOL noWelcome)
     if (startup || ((g_set.flags & AF_BACKGROUND) && (g_set.flags & AF_WELCOMED))) {
         /* Autostart, or background mode: restore silently, stay in the tray. */
         Engine_RestoreAll(NULL, FALSE);
+        Links_RestoreAll();
         rebuild_list();
         if (!(g_set.flags & AF_BACKGROUND)) {
             /* Nothing to keep running for: leave once network drives are done. */

@@ -30,7 +30,7 @@ if errorlevel 1 exit /b 1
 
 cl /nologo /c /TC /std:c17 /utf-8 /O2 /MT /W4 /WX /permissive- /guard:cf /sdl /GS ^
    /DNDEBUG /Fo"%OBJ%\\" src\main.c src\ui.c src\engine.c src\drives.c src\uac.c ^
-   src\recycle.c src\settings.c src\lang.c src\theme.c src\gfx.c
+   src\recycle.c src\settings.c src\lang.c src\theme.c src\gfx.c src\links.c
 if errorlevel 1 exit /b 1
 
 rem Hardening: ASLR with high entropy, DEP, CFG, CET shadow stack (x64).

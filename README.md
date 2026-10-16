@@ -14,6 +14,8 @@ like `SUBST` and `NET USE`, and adds what those commands lack:
   again, or a network share becoming reachable again
 - **Network drives** managed in the same list, connected in the background
 - **Long paths**: targets longer than 260 characters (SUBST.EXE cannot even list or remove those)
+- **Folder links**: a short path such as `C:\p` that leads to a folder. Unlike a drive letter it
+  lives in the file system, so every user, elevated program and service sees it at once
 
 OpenSubst offers the same feature set as NTWind Visual Subst 6.1 - without the restrictions of
 its unregistered version (which only allows the Documents, Pictures and Videos folders), without
@@ -26,7 +28,8 @@ translations of Visual Subst are used.
 |---|---|
 | Drive list | grouped into *Virtual drives* / *Network drives* (optional), toggle switch to enable/disable, remove button, double-click opens the drive, context menu |
 | Editor | folder or UNC path (browse, drag & drop), custom icon (`file,index`, icon picker), drive letter, label, toggles for UAC / Recycle Bin / Auto-Restore |
-| Commands | Refresh (F5), Enable all, Disable all, Remove all, Register/Unregister UAC task |
+| Folder links | own group *Folder links* at the end of the list (also without grouping), toggle switch, remove button, double-click opens the link, context menu with Open, Open target, Edit and Enabled; a dialog to create and edit links whose folder picker only accepts a local drive with a file system that supports links |
+| Commands | Refresh (F5), New folder link, Enable all, Disable all, Remove all, Register/Unregister UAC task (*Enable/Disable/Remove all* only affect drives) |
 | Settings menu | *Operation:* create drives at Windows startup, run in background, tray icon (forced on, greyed out, in background mode) - *Drives:* manage network drives, show only OpenSubst drives, group by type - *Appearance:* language (English, German, external `.lng` files), theme Auto / Light / Dark, always on top |
 | Tray | show/hide, enable/disable every stored drive, exit. *Tray icon* only adds the icon; *background mode* also keeps OpenSubst running when the window is closed and starts it hidden in the tray |
 | Safety prompts | Restore saved drives?, Apply changes?, Remove all?, Keep running for Auto-Restore?, Enable background mode?, removing drives OpenSubst did not create |
@@ -41,6 +44,8 @@ Drives created elsewhere (with `subst`, `net use` or Explorer) are shown too and
 ```
 OpenSubst [drive1: [drive2:]path] [label] [options]
 OpenSubst drive1: /D
+OpenSubst /LINK link target
+OpenSubst /UNLINK link
 OpenSubst /LIST
 ```
 
@@ -50,10 +55,12 @@ OpenSubst /LIST
 | `/UAC`, `/NOUAC` | also create the drive for elevated applications (needs the UAC task) |
 | `/RECYCLEBIN` | create a Recycle Bin on the drive |
 | `/AUTORESTORE` | re-mount the drive automatically |
-| `/NOSAVE` | do not store the drive (with `/D`: only unmount, keep it stored) |
-| `/NOCREATE` | only store the drive, do not mount it now |
+| `/NOSAVE` | do not store the drive or link (with `/D` or `/UNLINK`: only remove it, keep it stored) |
+| `/NOCREATE` | only store the drive or link, do not create it now |
 | `/D` | remove the drive |
-| `/LIST` | list all virtual and network drives |
+| `/LINK link target` | create a folder link (a link already stored at that path is pointed to the new target) |
+| `/UNLINK link` | remove a folder link - never the contents of the target; real folders are refused |
+| `/LIST` | list all virtual and network drives and all stored folder links |
 | `/STARTUP` | restore stored drives (used by the autostart entry) |
 | `/NOWELCOME`, `/NOMSG` | no welcome message / no messages at all |
 | `/REGTASK`, `/UNREGTASK` | register or remove the UAC task (asks for elevation) |
@@ -65,6 +72,8 @@ Examples:
 OpenSubst P: "C:\Projects" Projects /ICON "C:\Icons\Drive.ico"
 OpenSubst N: \\server\share Share /AUTORESTORE
 OpenSubst P: /D
+OpenSubst /LINK C:\p "D:\Projects\Customer A"
+OpenSubst /UNLINK C:\p
 ```
 
 Messages are printed to the console when OpenSubst is started from one, otherwise shown as
@@ -116,6 +125,22 @@ The HKLM part needs administrator rights once per letter; it goes through the UA
 UAC prompt if the task is not registered. Deleted files go to `X:\$RECYCLE.BIN`, i.e. a hidden
 folder inside the target folder.
 
+**Folder links** are file-system objects, not session objects: a link at `C:\p` is the same for
+every user, elevated programs and services, and each of them keeps their own access rights to
+the target. A local target gets a *junction* (`FSCTL_SET_REPARSE_POINT`, no administrator rights
+needed). A network target gets a *directory symbolic link*, which needs Windows Developer Mode or
+the "Create symbolic links" right. OpenSubst never tries to get that right through elevation:
+links are always created with the rights of the running user, never through the UAC task.
+Targets on a virtual or network drive letter are stored as the folder or UNC path behind it,
+because drive letters exist per logon session and would lead nowhere for other users.
+
+OpenSubst only creates links at free paths and never replaces an existing folder, file or link.
+It only removes a link that still points to the stored target, and only the link object itself
+(`RemoveDirectory` on a reparse point), never anything inside the target. The link has to be on
+a local drive whose file system supports reparse points, such as NTFS. FAT32 and exFAT drives are
+refused with a message before anything is created. Stored links are created again at startup if
+they have gone. Because links live in the file system, Auto-Restore does not apply to them.
+
 **Auto-Restore** checks every 5 seconds (and immediately on device arrival) whether a drive with
 Auto-Restore is missing. Virtual drives are re-created as soon as the target folder exists;
 network drives are retried every 30 seconds in the background. This needs OpenSubst running
@@ -133,6 +158,8 @@ HKCU\Software\OpenSubst
 HKCU\Software\OpenSubst\Drives\<X>
     Path, Label, Icon (REG_SZ), Flags (REG_DWORD: 1 enabled, 2 UAC, 4 Recycle Bin,
                                       8 Auto-Restore, 16 network drive)
+HKCU\Software\OpenSubst\Links\<nn>   (00-31)
+    Link, Target (REG_SZ), Flags (REG_DWORD: 1 enabled)
 ```
 
 OpenSubst is portable: it needs no installer and keeps nothing outside the registry keys above
@@ -179,6 +206,7 @@ exe of about 300 KB. `tools/make_icon.py` (Pillow) regenerates `res/app.ico`.
 | `src/drives.c` | DOS device, WNet and Explorer label/icon primitives |
 | `src/uac.c` | Task Scheduler 2.0 (COM, plain C) and the elevated operation protocol |
 | `src/recycle.c` | known-folder Recycle Bin registration |
+| `src/links.c` | folder links: junctions, directory symbolic links, their storage |
 | `src/settings.c` | registry persistence, autostart |
 | `src/lang.c`, `src/strings.h` | built-in strings and `.lng` loader |
 | `src/theme.c` | Light/Dark, dark menu bar and buttons |
@@ -187,7 +215,9 @@ exe of about 300 KB. `tools/make_icon.py` (Pillow) regenerates `res/app.ico`.
 ## Requirements
 
 Windows 7 SP1 or later (Windows 10/11 recommended; dark mode needs Windows 10 1809+). UAC drives need an administrator account with UAC enabled; the Recycle
-Bin needs an administrator account. Standard users can use everything else.
+Bin needs an administrator account. Standard users can use everything else. Folder links need a
+drive with reparse-point support, such as NTFS, for the link (not FAT32 or exFAT); links to network targets also need Developer Mode or the
+"Create symbolic links" right.
 
 ## Licence
 
