@@ -1,5 +1,7 @@
 # OpenSubst
 
+![screenshot](screenshot.png)
+
 Free and open-source virtual drive manager for Windows, written in plain C (Win32 API, no
 frameworks, no runtime dependencies). It maps folders and network shares to drive letters,
 like `SUBST` and `NET USE`, and adds what those commands lack:
