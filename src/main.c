@@ -267,7 +267,7 @@ static int cli_link(const Cli *a)
 
     /* A link already stored at this path is re-pointed, not duplicated. */
     if (Link_ResolveLocation(a->linkPath, link, ARRAYSIZE(link))) i = Links_Find(link);
-    if (Links_CheckInput(i, a->linkPath, a->linkTarget, &nc, NULL)) return 1;
+    if (Links_CheckInput(i, a->linkPath, a->linkTarget, 0, &nc, NULL)) return 1;
     if (i < 0) i = Links_FreeSlot();
     r = Links_Set(i, &nc, NULL, TRUE, !a->nocreate);
     if (r == 0 && !a->nosave) Links_Save(i);

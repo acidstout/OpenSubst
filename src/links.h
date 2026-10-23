@@ -23,6 +23,7 @@
 typedef struct LinkConfig {
     BOOL    used;
     DWORD   flags;                  /* DF_ENABLED */
+    int     kind;                   /* LK_JUNCTION or LK_SYMLINK          */
     wchar_t link[PATHBUF];          /* where the link lives, e.g. C:\p   */
     wchar_t target[PATHBUF];        /* resolved folder or UNC path       */
 } LinkConfig;
@@ -60,7 +61,8 @@ BOOL  Link_VolumeSupported(const wchar_t *path, wchar_t *desc, size_t cch);
 BOOL  Link_PathsOverlap(const wchar_t *a, const wchar_t *b);
 
 /* Create a link at a free path. Win32 error code (0 = success). */
-DWORD Link_Create(const wchar_t *link, const wchar_t *target);
+/* kind: LK_JUNCTION (local targets only) or LK_SYMLINK. */
+DWORD Link_Create(const wchar_t *link, const wchar_t *target, int kind);
 /* Remove the link object itself (never the target's contents). Refuses
    anything that is not a junction or symbolic link. */
 DWORD Link_Remove(const wchar_t *link);
@@ -78,10 +80,18 @@ DWORD Links_Apply(int i, HWND owner, BOOL interactive);     /* create if missing
 DWORD Links_Unapply(int i, HWND owner, BOOL interactive);   /* remove if ours    */
 void  Links_RestoreAll(void);
 
+/* Store an existing junction or symbolic link at 'path' as it is (nothing is
+   created or changed). Returns its slot, or -1 (not a link, relative target,
+   already stored, no free slot). */
+int   Links_Adopt(const wchar_t *path);
+/* Adopt every link directly inside 'folder'. Returns the number added. */
+int   Links_ScanFolder(const wchar_t *folder);
+
 /* Check typed input for slot 'self' (-1 = a new link). Fills 'out' with the
    canonical paths and reports the first problem with App_Message. Returns 0,
-   or the field at fault: 1 = link, 2 = target. */
-int   Links_CheckInput(int self, const wchar_t *link, const wchar_t *target,
+   or the field at fault: 1 = link, 2 = target. 'kind' is LK_JUNCTION,
+   LK_SYMLINK or 0 (automatic: junction for local, symlink for network). */
+int   Links_CheckInput(int self, const wchar_t *link, const wchar_t *target, int kind,
                        LinkConfig *out, HWND owner);
 /* Put the checked link 'nc' (enabled) into slot i - a free slot or the one
    being edited - and, with 'create', create it (an edited link that moved is

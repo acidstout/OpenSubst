@@ -245,7 +245,7 @@ static DWORD create_junction(const wchar_t *lp, const wchar_t *target)
     return r;
 }
 
-DWORD Link_Create(const wchar_t *link, const wchar_t *target)
+DWORD Link_Create(const wchar_t *link, const wchar_t *target, int kind)
 {
     wchar_t lp[PATHBUF + 8], parent[PATHBUF];
     LinkState st;
@@ -260,10 +260,13 @@ DWORD Link_Create(const wchar_t *link, const wchar_t *target)
     if (!Path_IsDirectory(parent)) return ERROR_PATH_NOT_FOUND;
     if (!fs_path(link, lp, ARRAYSIZE(lp))) return ERROR_FILENAME_EXCED_RANGE;
 
-    if (!Path_IsUnc(target)) return create_junction(lp, target);
+    if (kind == LK_JUNCTION) {
+        if (Path_IsUnc(target)) return ERROR_NOT_SUPPORTED;     /* junctions are local only */
+        return create_junction(lp, target);
+    }
 
-    /* Network target: a directory symbolic link. Without Developer Mode or
-       the privilege this fails with ERROR_PRIVILEGE_NOT_HELD - by design no
+    /* A directory symbolic link. Without Developer Mode, the privilege or an
+       elevated token this fails with ERROR_PRIVILEGE_NOT_HELD - by design no
        elevation is attempted. */
     if (CreateSymbolicLinkW(lp, target, SYMBOLIC_LINK_FLAG_DIRECTORY |
                                         SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE))
@@ -335,6 +338,14 @@ void Links_LoadAll(void)
         if (!Link_ResolveTarget(raw, c->target, ARRAYSIZE(c->target))) c->target[0] = 0;
         if (RegQueryValueExW(k, L"Flags", NULL, &type, (BYTE *)&fl, &cb) != ERROR_SUCCESS || type != REG_DWORD)
             fl = DF_ENABLED;
+        {
+            DWORD kd = 0;
+            cb = sizeof(kd);
+            if (RegQueryValueExW(k, L"Kind", NULL, &type, (BYTE *)&kd, &cb) != ERROR_SUCCESS || type != REG_DWORD)
+                kd = 0;
+            /* A junction cannot reach a network path; older entries have no kind. */
+            c->kind = (kd == LK_SYMLINK || Path_IsUnc(c->target)) ? LK_SYMLINK : LK_JUNCTION;
+        }
         RegCloseKey(k);
         c->flags = fl & DF_ENABLED;
         c->used = c->link[0] && c->target[0] && !Link_PathsOverlap(c->link, c->target);
@@ -358,6 +369,10 @@ void Links_Save(int i)
     RegSetValueExW(k, L"Target", 0, REG_SZ, (const BYTE *)c->target,
                    (DWORD)((lstrlenW(c->target) + 1) * sizeof(wchar_t)));
     RegSetValueExW(k, L"Flags", 0, REG_DWORD, (const BYTE *)&c->flags, sizeof(c->flags));
+    {
+        DWORD kd = (DWORD)c->kind;
+        RegSetValueExW(k, L"Kind", 0, REG_DWORD, (const BYTE *)&kd, sizeof(kd));
+    }
     RegCloseKey(k);
 }
 
@@ -428,7 +443,7 @@ DWORD Links_Apply(int i, HWND owner, BOOL interactive)
     if (i < 0 || i >= MAX_LINKS || !g_links[i].used) return ERROR_INVALID_PARAMETER;
     c = &g_links[i];
     Link_Query(c->link, &st);
-    if ((st.kind == LK_JUNCTION || st.kind == LK_SYMLINK) && lstrcmpiW(st.target, c->target) == 0)
+    if (st.kind == c->kind && lstrcmpiW(st.target, c->target) == 0)
         return 0;   /* already there */
     if (st.kind != LK_NONE) {
         /* Something else is at the link path: never replace it. */
@@ -439,7 +454,7 @@ DWORD Links_Apply(int i, HWND owner, BOOL interactive)
         }
         return ERROR_ALREADY_EXISTS;
     }
-    r = Link_Create(c->link, c->target);
+    r = Link_Create(c->link, c->target, c->kind);
     if (r && interactive) report(owner, S_E_LK_CREATE, c->link, r);
     return r;
 }
@@ -463,6 +478,61 @@ DWORD Links_Unapply(int i, HWND owner, BOOL interactive)
     return r;
 }
 
+int Links_Adopt(const wchar_t *path)
+{
+    wchar_t link[PATHBUF];
+    LinkState st;
+    LinkConfig *c;
+    int i;
+
+    if (!Link_ResolveLocation(path, link, ARRAYSIZE(link)) || Links_Find(link) >= 0) return -1;
+    Link_Query(link, &st);
+    if (st.kind != LK_JUNCTION && st.kind != LK_SYMLINK) return -1;
+    /* Relative symlinks resolve against their own folder; store only absolute ones. */
+    if (!Path_IsAbsoluteSpec(st.target) || Link_PathsOverlap(link, st.target)) return -1;
+    i = Links_FreeSlot();
+    if (i < 0) return -1;
+    c = &g_links[i];
+    ZeroMemory(c, sizeof(*c));
+    c->used = TRUE;
+    c->flags = DF_ENABLED;
+    c->kind = st.kind;
+    StringCchCopyW(c->link, ARRAYSIZE(c->link), link);
+    StringCchCopyW(c->target, ARRAYSIZE(c->target), st.target);    /* as found, so it stays "ours" */
+    Links_Save(i);
+    return i;
+}
+
+int Links_ScanFolder(const wchar_t *folder)
+{
+    /* shortcut: one folder level, not recursive - a whole-drive scan takes
+       minutes and finds every system link; add recursion if users ask for it. */
+    wchar_t pattern[PATHBUF + 8];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    int added = 0;
+
+    if (FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s%s*", folder,
+                                folder[0] && folder[lstrlenW(folder) - 1] == L'\\' ? L"" : L"\\")))
+        return 0;
+    h = FindFirstFileExW(pattern, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        wchar_t path[PATHBUF];
+        if ((fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) !=
+            (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))
+            continue;
+        if (fd.dwReserved0 != IO_REPARSE_TAG_MOUNT_POINT && fd.dwReserved0 != IO_REPARSE_TAG_SYMLINK) continue;
+        if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s%s%s", folder,
+                                    folder[lstrlenW(folder) - 1] == L'\\' ? L"" : L"\\", fd.cFileName)))
+            continue;
+        if (Links_Adopt(path) >= 0) added++;
+        if (Links_FreeSlot() < 0) break;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return added;
+}
+
 void Links_RestoreAll(void)
 {
     int i;
@@ -479,7 +549,7 @@ static int input_error(HWND owner, StrId fmt, const wchar_t *arg, int field)
     return field;
 }
 
-int Links_CheckInput(int self, const wchar_t *link, const wchar_t *target,
+int Links_CheckInput(int self, const wchar_t *link, const wchar_t *target, int kind,
                      LinkConfig *out, HWND owner)
 {
     wchar_t parent[PATHBUF];
@@ -498,6 +568,9 @@ int Links_CheckInput(int self, const wchar_t *link, const wchar_t *target,
     }
     if (!Path_IsDirectoryTimeout(out->target, DIR_TIMEOUT_USER))
         return input_error(owner, S_E_LK_TARGET, out->target, 2);
+    if (kind == LK_JUNCTION && Path_IsUnc(out->target))
+        return input_error(owner, S_E_LK_JUNCUNC, NULL, 2);
+    out->kind = (kind == LK_SYMLINK || Path_IsUnc(out->target)) ? LK_SYMLINK : LK_JUNCTION;
     if (Link_PathsOverlap(out->link, out->target)) return input_error(owner, S_E_LK_NESTED, NULL, 1);
     dup = Links_Find(out->link);
     if (dup >= 0 && dup != self) return input_error(owner, S_E_LK_DUP, out->link, 1);
@@ -517,7 +590,7 @@ int Links_CheckInput(int self, const wchar_t *link, const wchar_t *target,
     Link_Query(out->link, &st);
     if (st.kind != LK_NONE) {
         BOOL isLink = st.kind == LK_JUNCTION || st.kind == LK_SYMLINK;
-        BOOL same = isLink && lstrcmpiW(st.target, out->target) == 0;
+        BOOL same = st.kind == out->kind && lstrcmpiW(st.target, out->target) == 0;
         BOOL own = isLink && self >= 0 && self < MAX_LINKS && g_links[self].used &&
                    lstrcmpiW(g_links[self].link, out->link) == 0 &&
                    lstrcmpiW(g_links[self].target, st.target) == 0;
@@ -536,7 +609,8 @@ DWORD Links_Set(int i, const LinkConfig *nc, HWND owner, BOOL interactive, BOOL 
     if (i < 0 || i >= MAX_LINKS || !nc || !nc->link[0] || !nc->target[0]) return ERROR_INVALID_PARAMETER;
     old = g_links[i];
     if (create && old.used &&
-        (lstrcmpiW(old.link, nc->link) != 0 || lstrcmpiW(old.target, nc->target) != 0)) {
+        (lstrcmpiW(old.link, nc->link) != 0 || lstrcmpiW(old.target, nc->target) != 0 ||
+         old.kind != nc->kind)) {
         r = Links_Unapply(i, owner, interactive);
         if (r) return r;
     }

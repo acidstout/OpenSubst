@@ -36,7 +36,7 @@
 enum {
     IDC_LIST = 100, IDC_PATH, IDC_PATHBTN, IDC_ICONEDIT, IDC_ICONBTN, IDC_LETTER, IDC_LABEL,
     IDC_T_UAC, IDC_T_RECYCLE, IDC_T_AUTO,
-    IDC_L_PATH, IDC_L_ICON, IDC_L_DRIVE
+    IDC_L_PATH, IDC_L_ICON, IDC_L_DRIVE, IDC_L_TYPE, IDC_TYPE, IDC_LINKEDIT, IDC_LINKBTN
 };
 #define IDC_MOUNT IDOK
 
@@ -49,7 +49,7 @@ enum {
     IDM_O_STARTUP, IDM_O_BACKGROUND, IDM_O_MANAGENET, IDM_O_ONLYOURS,
     IDM_D_OPEN, IDM_D_OPENPATH, IDM_D_ENABLED, IDM_D_UAC, IDM_D_RECYCLE, IDM_D_AUTO,
     IDM_D_MANAGE, IDM_D_REMOVE, IDM_T_SHOWHIDE,
-    IDM_LINK_NEW, IDM_LINK_EDIT, IDM_L_OPENTARGET,
+    IDM_LINK_NEW, IDM_L_OPENTARGET, IDM_LINK_SCAN,
     IDM_LANG_FILE = 1200,       /* + index */
     IDM_T_DRIVE = 1300          /* + letter index */
 };
@@ -89,6 +89,7 @@ typedef struct Row {
 
 static HWND   s_wnd, s_list, s_path, s_pathBtn, s_icon, s_iconBtn, s_letter, s_label;
 static HWND   s_tog[3], s_mount, s_lbl[3], s_tip;
+static HWND   s_lblType, s_type, s_linkEdit, s_linkBtn;   /* editor: type, link location */
 static HFONT  s_font, s_fontBold, s_fontGroup, s_fontGlyph;
 static BOOL   s_haveGlyphFont;
 static int    s_dpi = 96;
@@ -387,6 +388,9 @@ static void apply_theme(void)
     Theme_ApplyToEdit(s_icon);
     Theme_ApplyToEdit(s_label);
     Theme_ApplyToCombo(s_letter);
+    Theme_ApplyToCombo(s_type);
+    Theme_ApplyToEdit(s_linkEdit);
+    Theme_ApplyToButton(s_linkBtn);
     Theme_ApplyToButton(s_pathBtn);
     Theme_ApplyToButton(s_iconBtn);
     Theme_ApplyToButton(s_mount);
@@ -410,7 +414,7 @@ static void build_menus(void)
 
     AppendMenuW(cmd, MF_STRING, IDM_REFRESH, T(S_M_REFRESH));
     AppendMenuW(cmd, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(cmd, MF_STRING, IDM_LINK_NEW, T(S_M_LINK_NEW));
+    AppendMenuW(cmd, MF_STRING, IDM_LINK_SCAN, T(S_M_LINK_SCAN));
     AppendMenuW(cmd, MF_SEPARATOR, 0, NULL);
     AppendMenuW(cmd, MF_STRING, IDM_ENABLEALL, T(S_M_ENABLEALL));
     AppendMenuW(cmd, MF_STRING, IDM_DISABLEALL, T(S_M_DISABLEALL));
@@ -1156,11 +1160,88 @@ static DWORD toggle_flags(void)
     return f;
 }
 
+/* Editor types, in the order of the "Type" combo box. */
+enum { TY_SUBST, TY_NET, TY_JUNCTION, TY_SYMLINK };
+
+static int editor_type(void)
+{
+    int t = (int)SendMessageW(s_type, CB_GETCURSEL, 0, 0);
+    return (t >= TY_SUBST && t <= TY_SYMLINK) ? t : TY_SUBST;
+}
+
+static BOOL editor_is_link(void) { return editor_type() >= TY_JUNCTION; }
+
+/* Index of the stored link the link field names, or -1. */
+static int editor_link_slot(void)
+{
+    wchar_t raw[PATHBUF], res[PATHBUF];
+    get_text(s_linkEdit, raw, ARRAYSIZE(raw));
+    StrTrimW(raw, L" \t\"");
+    if (!Link_ResolveLocation(raw, res, ARRAYSIZE(res))) return -1;
+    return Links_Find(res);
+}
+
 static void update_mount_caption(void)
 {
-    wchar_t l = combo_letter();
-    BOOL apply = l && g_cfg[LETTER_INDEX(l)].used;
-    SetWindowTextW(s_mount, T(apply ? S_BTN_APPLY : S_BTN_MOUNT));
+    if (editor_is_link()) {
+        StrId cap = S_BTN_CREATELINK;
+        if (editor_link_slot() >= 0) {
+            cap = S_BTN_APPLY;
+        } else {
+            wchar_t raw[PATHBUF], res[PATHBUF];
+            LinkState st;
+            get_text(s_linkEdit, raw, ARRAYSIZE(raw));
+            StrTrimW(raw, L" \t\"");
+            if (Link_ResolveLocation(raw, res, ARRAYSIZE(res))) {
+                Link_Query(res, &st);
+                if (st.kind == LK_JUNCTION || st.kind == LK_SYMLINK) cap = S_BTN_ADOPTLINK;
+            }
+        }
+        SetWindowTextW(s_mount, T(cap));
+    } else {
+        wchar_t l = combo_letter();
+        BOOL apply = l && g_cfg[LETTER_INDEX(l)].used;
+        SetWindowTextW(s_mount, T(apply ? S_BTN_APPLY : S_BTN_MOUNT));
+    }
+}
+
+/* Drive types show icon, letter, label and the three toggles; link types
+   show the link location in the icon row instead. */
+static void set_editor_type(int t)
+{
+    BOOL link = t >= TY_JUNCTION;
+    int k, show = link ? SW_HIDE : SW_SHOW;
+    if (t != editor_type() || SendMessageW(s_type, CB_GETCURSEL, 0, 0) < 0)
+        SendMessageW(s_type, CB_SETCURSEL, (WPARAM)t, 0);
+    SetWindowTextW(s_lbl[0], T(link ? S_LK_TARGET : S_LBL_PATH));
+    SetWindowTextW(s_lbl[1], T(link ? S_LK_LINK : S_LBL_ICON));
+    ShowWindow(s_icon, show);
+    ShowWindow(s_iconBtn, show);
+    ShowWindow(s_lbl[2], show);
+    ShowWindow(s_letter, show);
+    ShowWindow(s_label, show);
+    for (k = 0; k < 3; k++) ShowWindow(s_tog[k], show);
+    ShowWindow(s_linkEdit, link ? SW_SHOW : SW_HIDE);
+    ShowWindow(s_linkBtn, link ? SW_SHOW : SW_HIDE);
+    layout();
+    update_mount_caption();
+}
+
+/* The type follows the path where only one type fits: a network path makes a
+   virtual drive a network drive and a junction a symbolic link, and back. */
+static void type_follow_path(void)
+{
+    wchar_t raw[PATHBUF];
+    int t = editor_type(), n = t;
+    BOOL unc, local;
+    get_text(s_path, raw, ARRAYSIZE(raw));
+    StrTrimW(raw, L" \t\"");
+    unc = Path_IsUnc(raw);
+    local = raw[0] && raw[1] == L':';
+    if (t == TY_SUBST && unc) n = TY_NET;
+    else if (t == TY_NET && local) n = TY_SUBST;
+    else if (t == TY_JUNCTION && unc) n = TY_SYMLINK;
+    if (n != t) set_editor_type(n);
 }
 
 /* Load the selected row into the editor fields. */
@@ -1168,14 +1249,18 @@ static void update_editor_for_letter(void)
 {
     int sel = (int)SendMessageW(s_list, LB_GETCURSEL, 0, 0);
     if (sel >= 0 && sel < s_nrows && s_rows[sel].type == ROW_LINK) {
-        /* The editor below is for drives only: keep what it shows. */
+        const LinkConfig *lc = &g_links[s_rows[sel].link];
         s_selLetter = 0;
         s_selLink = s_rows[sel].link;
+        set_editor_type(lc->kind == LK_SYMLINK ? TY_SYMLINK : TY_JUNCTION);
+        SetWindowTextW(s_path, lc->target);
+        SetWindowTextW(s_linkEdit, lc->link);
     } else if (sel >= 0 && sel < s_nrows && s_rows[sel].type == ROW_DRIVE) {
         const Row *r = &s_rows[sel];
         const DriveConfig *c = &g_cfg[LETTER_INDEX(r->letter)];
         s_selLetter = r->letter;
         s_selLink = -1;
+        set_editor_type((r->managed ? (c->flags & DF_NETWORK) != 0 : r->network) ? TY_NET : TY_SUBST);
         if (r->managed) {
             SetWindowTextW(s_path, c->path);
             SetWindowTextW(s_label, c->label);
@@ -1227,6 +1312,38 @@ static void ask_background_for_autorestore(void)
     }
 }
 
+/* "Create link" / "Apply changes" for the link types. A link is identified by
+   its location, like a drive by its letter: a stored link at the typed path is
+   changed, any other path creates a new link. */
+static void on_link_apply(void)
+{
+    wchar_t link[PATHBUF], target[PATHBUF];
+    LinkConfig nc;
+    int slot = editor_link_slot(), field, i;
+
+    get_text(s_linkEdit, link, ARRAYSIZE(link));
+    get_text(s_path, target, ARRAYSIZE(target));
+    StrTrimW(link, L" \t\"");
+    StrTrimW(target, L" \t\"");
+    if (!target[0]) { App_Message(s_wnd, T(S_E_CHOOSEFOLDER), TRUE); SetFocus(s_path); return; }
+    if (!link[0]) { App_Message(s_wnd, T(S_E_LK_PATH), TRUE); SetFocus(s_linkEdit); return; }
+
+    field = Links_CheckInput(slot, link, target,
+                             editor_type() == TY_SYMLINK ? LK_SYMLINK : LK_JUNCTION, &nc, s_wnd);
+    if (field) {
+        HWND e = field == 1 ? s_linkEdit : s_path;
+        SetFocus(e);
+        SendMessageW(e, EM_SETSEL, 0, -1);
+        return;
+    }
+    i = slot >= 0 ? slot : Links_FreeSlot();
+    if (Links_Set(i, &nc, s_wnd, TRUE, TRUE) != 0) return;
+    Links_Save(i);
+    s_selLink = i;
+    s_selLetter = 0;
+    rebuild_list();
+}
+
 static void on_mount(void)
 {
     wchar_t raw[PATHBUF], path[PATHBUF], label[LABELBUF], icon[ICONBUF];
@@ -1236,6 +1353,10 @@ static void on_mount(void)
     DWORD flags = toggle_flags();
     BOOL net;
 
+    if (editor_is_link()) {
+        on_link_apply();
+        return;
+    }
     get_text(s_path, raw, ARRAYSIZE(raw));
     get_text(s_label, label, ARRAYSIZE(label));
     get_text(s_icon, icon, ARRAYSIZE(icon));
@@ -1637,12 +1758,6 @@ static void open_link(int i, BOOL target)
     open_path(target ? g_links[i].target : g_links[i].link);
 }
 
-static void dlg_text(HWND dlg, int id, wchar_t *out, int cch)
-{
-    get_text(GetDlgItem(dlg, id), out, cch);
-    StrTrimW(out, L" \t");
-}
-
 /* Last component of a folder path, or "" for a root. */
 static void path_leaf(const wchar_t *p, wchar_t *out, size_t cch)
 {
@@ -1676,22 +1791,24 @@ static BOOL link_parent_ok(HWND owner, const wchar_t *folder)
 
 /* "..." next to the link: pick the folder the link goes into, keep the name
    typed so far (or suggest the target's name). */
-static void link_browse_parent(HWND dlg)
+static void link_browse_parent(void)
 {
     wchar_t cur[PATHBUF], start[PATHBUF], name[PATHBUF], parent[PATHBUF], res[PATHBUF];
-    HWND edit = GetDlgItem(dlg, IDC_LK_LINK);
+    HWND edit = s_linkEdit;
     int n;
 
-    dlg_text(dlg, IDC_LK_LINK, cur, ARRAYSIZE(cur));
+    get_text(s_linkEdit, cur, ARRAYSIZE(cur));
+    StrTrimW(cur, L" \t\"");
     StringCchCopyW(start, ARRAYSIZE(start), cur);
     if (start[0]) PathRemoveFileSpecW(start);
-    if (!pick_folder_ex(dlg, T(S_LK_BROWSE_PARENT), start, link_parent_ok, parent, ARRAYSIZE(parent)))
+    if (!pick_folder_ex(s_wnd, T(S_LK_BROWSE_PARENT), start, link_parent_ok, parent, ARRAYSIZE(parent)))
         return;
 
     path_leaf(cur, name, ARRAYSIZE(name));
     if (!name[0]) {
         wchar_t target[PATHBUF];
-        dlg_text(dlg, IDC_LK_TARGET, target, ARRAYSIZE(target));
+        get_text(s_path, target, ARRAYSIZE(target));
+        StrTrimW(target, L" \t\"");
         path_leaf(target, name, ARRAYSIZE(name));
     }
     StringCchCopyW(res, ARRAYSIZE(res), parent);
@@ -1703,95 +1820,49 @@ static void link_browse_parent(HWND dlg)
     SendMessageW(edit, EM_SETSEL, (WPARAM)lstrlenW(res), (LPARAM)lstrlenW(res));
 }
 
-static void link_browse_target(HWND dlg)
+/* The link field names an existing junction or symlink that is not stored:
+   show what it is, so "Add link" takes it over unchanged. */
+static void link_field_changed(void)
 {
-    wchar_t cur[PATHBUF], p[PATHBUF];
-    dlg_text(dlg, IDC_LK_TARGET, cur, ARRAYSIZE(cur));
-    if (pick_folder(dlg, NULL, cur, p, ARRAYSIZE(p))) SetDlgItemTextW(dlg, IDC_LK_TARGET, p);
+    wchar_t raw[PATHBUF], res[PATHBUF];
+    LinkState st;
+    get_text(s_linkEdit, raw, ARRAYSIZE(raw));
+    StrTrimW(raw, L" \t\"");
+    if (editor_link_slot() < 0 && Link_ResolveLocation(raw, res, ARRAYSIZE(res))) {
+        Link_Query(res, &st);
+        if ((st.kind == LK_JUNCTION || st.kind == LK_SYMLINK) && Path_IsAbsoluteSpec(st.target)) {
+            set_editor_type(st.kind == LK_SYMLINK ? TY_SYMLINK : TY_JUNCTION);
+            SetWindowTextW(s_path, st.target);
+        }
+    }
+    update_mount_caption();
 }
 
-static void link_dlg_ok(HWND dlg)
+static void link_scan(void)
 {
-    int slot = (int)GetWindowLongPtrW(dlg, DWLP_USER), i, field;
-    wchar_t link[PATHBUF], target[PATHBUF];
-    LinkConfig nc;
+    wchar_t folder[PATHBUF], msg[256];
+    int n;
+    if (Links_FreeSlot() < 0) { App_Message(s_wnd, T(S_E_LK_FULL), TRUE); return; }
+    if (!pick_folder(s_wnd, T(S_LK_SCAN_TITLE), NULL, folder, ARRAYSIZE(folder))) return;
+    n = Links_ScanFolder(folder);
+    rebuild_list();
+    if (n) StringCchPrintfW(msg, ARRAYSIZE(msg), T(S_I_LK_SCAN), n);
+    else StringCchCopyW(msg, ARRAYSIZE(msg), T(S_I_LK_SCANNONE));
+    App_Message(s_wnd, msg, FALSE);
+}
 
-    dlg_text(dlg, IDC_LK_LINK, link, ARRAYSIZE(link));
-    dlg_text(dlg, IDC_LK_TARGET, target, ARRAYSIZE(target));
-    field = Links_CheckInput(slot, link, target, &nc, dlg);
-    if (field) {
-        HWND e = GetDlgItem(dlg, field == 1 ? IDC_LK_LINK : IDC_LK_TARGET);
-        SetFocus(e);
-        SendMessageW(e, EM_SETSEL, 0, -1);
-        return;
-    }
-    i = slot >= 0 ? slot : Links_FreeSlot();
-    /* Not created: the dialog stays open for a correction. */
-    if (Links_Set(i, &nc, dlg, TRUE, TRUE) != 0) return;
-    Links_Save(i);
-    s_selLink = i;
+/* "New folder link": an empty link editor. */
+static void link_new(void)
+{
+    wchar_t raw[PATHBUF];
+    SendMessageW(s_list, LB_SETCURSEL, (WPARAM)-1, 0);
+    s_selLink = -1;
     s_selLetter = 0;
-    EndDialog(dlg, IDOK);
-}
-
-static INT_PTR CALLBACK link_dlg_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
-{
-    switch (msg) {
-    case WM_INITDIALOG: {
-        static const int buttons[] = { IDC_LK_LINKBTN, IDC_LK_TARGETBTN, IDOK, IDCANCEL };
-        int slot = (int)lp, k;
-        SetWindowLongPtrW(dlg, DWLP_USER, (LONG_PTR)slot);
-        SetWindowTextW(dlg, T(S_LK_TITLE));
-        SetDlgItemTextW(dlg, IDC_LK_LBLLINK, T(S_LK_LINK));
-        SetDlgItemTextW(dlg, IDC_LK_LBLTARGET, T(S_LK_TARGET));
-        SetDlgItemTextW(dlg, IDC_LK_HINT, T(S_LK_HINT));
-        SetDlgItemTextW(dlg, IDCANCEL, T(S_BTN_CANCEL));
-        SendDlgItemMessageW(dlg, IDC_LK_LINK, EM_SETCUEBANNER, TRUE, (LPARAM)T(S_LK_CUE_LINK));
-        SendDlgItemMessageW(dlg, IDC_LK_TARGET, EM_SETCUEBANNER, TRUE, (LPARAM)T(S_CUE_PATH));
-        SendDlgItemMessageW(dlg, IDC_LK_LINK, EM_SETLIMITTEXT, PATHBUF - 1, 0);
-        SendDlgItemMessageW(dlg, IDC_LK_TARGET, EM_SETLIMITTEXT, PATHBUF - 1, 0);
-        if (link_valid(slot)) {
-            SetDlgItemTextW(dlg, IDC_LK_LINK, g_links[slot].link);
-            SetDlgItemTextW(dlg, IDC_LK_TARGET, g_links[slot].target);
-        }
-        Theme_ApplyToMainWindow(dlg);
-        Theme_ApplyToEdit(GetDlgItem(dlg, IDC_LK_LINK));
-        Theme_ApplyToEdit(GetDlgItem(dlg, IDC_LK_TARGET));
-        for (k = 0; k < (int)ARRAYSIZE(buttons); k++) Theme_ApplyToButton(GetDlgItem(dlg, buttons[k]));
-        return TRUE;
-    }
-    case WM_CTLCOLORDLG:
-        return (INT_PTR)Theme_BgBrush();
-    case WM_CTLCOLORSTATIC:
-        SetBkMode((HDC)wp, TRANSPARENT);
-        SetBkColor((HDC)wp, Theme_Bg());
-        SetTextColor((HDC)wp, Theme_Text());
-        return (INT_PTR)Theme_BgBrush();
-    case WM_CTLCOLOREDIT:
-        SetTextColor((HDC)wp, Theme_Text());
-        SetBkColor((HDC)wp, Theme_Surface());
-        return (INT_PTR)Theme_SurfaceBrush();
-    case WM_COMMAND:
-        switch (LOWORD(wp)) {
-        case IDC_LK_LINKBTN:   link_browse_parent(dlg); return TRUE;
-        case IDC_LK_TARGETBTN: link_browse_target(dlg); return TRUE;
-        case IDOK:             link_dlg_ok(dlg); return TRUE;
-        case IDCANCEL:         EndDialog(dlg, IDCANCEL); return TRUE;
-        }
-        break;
-    }
-    return FALSE;
-}
-
-/* Create (slot -1) or edit a folder link. */
-static void link_edit(int slot)
-{
-    if (slot >= 0 && !link_valid(slot)) return;
-    if (slot < 0 && Links_FreeSlot() < 0) {
-        App_Message(s_wnd, T(S_E_LK_FULL), TRUE);
-        return;
-    }
-    DialogBoxParamW(g_hinst, MAKEINTRESOURCEW(IDD_LINK), s_wnd, link_dlg_proc, (LPARAM)slot);
+    get_text(s_path, raw, ARRAYSIZE(raw));
+    StrTrimW(raw, L" \t\"");
+    set_editor_type(Path_IsUnc(raw) ? TY_SYMLINK : TY_JUNCTION);
+    SetWindowTextW(s_linkEdit, L"");
+    SetFocus(s_linkEdit);
 }
 
 static LPARAM row_key(const Row *r)
@@ -1877,7 +1948,6 @@ static void list_context_menu(int x, int y)
         AppendMenuW(m, MF_STRING, IDM_L_OPENTARGET, T(S_M_L_OPENTARGET));
         SetMenuDefaultItem(m, IDM_D_OPEN, FALSE);
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(m, MF_STRING, IDM_LINK_EDIT, T(S_M_LINK_EDIT));
         AppendMenuW(m, MF_STRING | ((c->flags & DF_ENABLED) ? MF_CHECKED : 0), IDM_D_ENABLED, T(S_M_D_ENABLED));
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
         AppendMenuW(m, MF_STRING, IDM_D_REMOVE, T(S_M_D_REMOVE));
@@ -1921,7 +1991,6 @@ static void list_context_menu(int x, int y)
         switch (cmd) {
         case IDM_D_OPEN:       open_link(link, FALSE); return;
         case IDM_L_OPENTARGET: open_link(link, TRUE); return;
-        case IDM_LINK_EDIT:    link_edit(link); break;
         case IDM_D_ENABLED:    link_set_enabled(link, !(g_links[link].flags & DF_ENABLED)); break;
         case IDM_D_REMOVE:     link_remove(link); break;
         default:
@@ -2108,12 +2177,15 @@ static void layout(void)
     W = rc.right;
     H = rc.bottom;
     lw = 0;
-    for (i = 0; i < 3; i++) {
-        wchar_t t[64];
-        int tw;
-        GetWindowTextW(s_lbl[i], t, ARRAYSIZE(t));
-        tw = text_width(s_font, t);
-        if (tw > lw) lw = tw;
+    {
+        /* Widest label of both editor modes, so fields do not jump on a type change. */
+        const wchar_t *labels[6];
+        labels[0] = T(S_LBL_PATH); labels[1] = T(S_LBL_ICON); labels[2] = T(S_LBL_DRIVE);
+        labels[3] = T(S_LBL_TYPE); labels[4] = T(S_LK_TARGET); labels[5] = T(S_LK_LINK);
+        for (i = 0; i < 6; i++) {
+            int tw = text_width(s_font, labels[i]);
+            if (tw > lw) lw = tw;
+        }
     }
     lw += S(10);
     x0 = M + lw;
@@ -2132,14 +2204,16 @@ static void layout(void)
         if (mw < S(130)) mw = S(130);
         {
             int w1 = text_width(s_font, T(S_BTN_MOUNT)) + S(40), w2 = text_width(s_font, T(S_BTN_APPLY)) + S(40);
+            int w3 = text_width(s_font, T(S_BTN_CREATELINK)) + S(40);
             if (w1 > mw) mw = w1;
             if (w2 > mw) mw = w2;
+            if (w3 > mw) mw = w3;
         }
         MOVE(s_mount, x0, y, mw, btnH);
     }
 
-    /* drive row */
-    y -= gap + rh;
+    /* drive row (drive types only) */
+    if (!editor_is_link()) y -= gap + rh;
     MOVE(s_lbl[2], M, y, lw, rh);
     MOVE(s_letter, x0, y, S(70), rh * 8);
     {
@@ -2153,6 +2227,8 @@ static void layout(void)
     MOVE(s_lbl[1], M, y, lw, rh);
     MOVE(s_icon, x0, y, W - M - bw - S(4) - x0, rh);
     MOVE(s_iconBtn, W - M - bw, y, bw, rh);
+    MOVE(s_linkEdit, x0, y, W - M - bw - S(4) - x0, rh);
+    MOVE(s_linkBtn, W - M - bw, y, bw, rh);
 
     /* path row */
     y -= gap + rh;
@@ -2160,20 +2236,27 @@ static void layout(void)
     MOVE(s_path, x0, y, W - M - bw - S(4) - x0, rh);
     MOVE(s_pathBtn, W - M - bw, y, bw, rh);
 
+    /* type row */
+    y -= gap + rh;
+    MOVE(s_lblType, M, y, lw, rh);
+    MOVE(s_type, x0, y, W - M - x0, rh * 8);
+
     /* list */
     SetRect(&s_listFrame, M, M, W - M, y - M);
     MOVE(s_list, M + 1, M + 1, W - 2 * M - 2, y - 2 * M - 2);
 #undef MOVE
     EndDeferWindowPos(dwp);
+    InvalidateRect(s_list, NULL, TRUE);
 
     SendMessageW(s_letter, CB_SETITEMHEIGHT, (WPARAM)-1, rh - S(6));
+    SendMessageW(s_type, CB_SETITEMHEIGHT, (WPARAM)-1, rh - S(6));
     InvalidateRect(s_wnd, NULL, TRUE);
 }
 
 static void set_fonts(void)
 {
     HWND kids[] = { s_list, s_path, s_pathBtn, s_icon, s_iconBtn, s_letter, s_label, s_mount,
-                    s_lbl[0], s_lbl[1], s_lbl[2] };
+                    s_lbl[0], s_lbl[1], s_lbl[2], s_lblType, s_type, s_linkEdit, s_linkBtn };
     int i;
     for (i = 0; i < (int)ARRAYSIZE(kids); i++) SendMessageW(kids[i], WM_SETFONT, (WPARAM)s_font, TRUE);
 }
@@ -2184,9 +2267,19 @@ static void set_texts(void)
     StringCchCopyW(title, ARRAYSIZE(title), T(S_APP_TITLE));
     if (g_elevated) StringCchCatW(title, ARRAYSIZE(title), T(S_ADMIN_SUFFIX));
     SetWindowTextW(s_wnd, title);
-    SetWindowTextW(s_lbl[0], T(S_LBL_PATH));
-    SetWindowTextW(s_lbl[1], T(S_LBL_ICON));
     SetWindowTextW(s_lbl[2], T(S_LBL_DRIVE));
+    SetWindowTextW(s_lblType, T(S_LBL_TYPE));
+    {
+        static const StrId types[4] = { S_TY_SUBST, S_TY_NET, S_TY_JUNCTION, S_TY_SYMLINK };
+        int t = editor_type(), k;
+        SendMessageW(s_type, CB_RESETCONTENT, 0, 0);
+        for (k = 0; k < 4; k++) SendMessageW(s_type, CB_ADDSTRING, 0, (LPARAM)T(types[k]));
+        SendMessageW(s_type, CB_SETCURSEL, (WPARAM)t, 0);
+        SetWindowTextW(s_lbl[0], T(t >= TY_JUNCTION ? S_LK_TARGET : S_LBL_PATH));
+        SetWindowTextW(s_lbl[1], T(t >= TY_JUNCTION ? S_LK_LINK : S_LBL_ICON));
+    }
+    SendMessageW(s_linkEdit, EM_SETCUEBANNER, TRUE, (LPARAM)T(S_LK_CUE_LINK));
+    SetWindowTextW(s_linkBtn, L"...");
     SendMessageW(s_path, EM_SETCUEBANNER, TRUE, (LPARAM)T(S_CUE_PATH));
     SendMessageW(s_label, EM_SETCUEBANNER, TRUE, (LPARAM)T(S_CUE_LABEL));
     SendMessageW(s_icon, EM_SETCUEBANNER, TRUE, (LPARAM)T(S_CUE_ICON));
@@ -2196,13 +2289,14 @@ static void set_texts(void)
 
     /* tooltips */
     {
-        static const int ids[] = { IDC_T_UAC, IDC_T_RECYCLE, IDC_T_AUTO, IDC_PATHBTN, IDC_ICONBTN };
-        StrId tips[5];
+        static const int ids[] = { IDC_T_UAC, IDC_T_RECYCLE, IDC_T_AUTO, IDC_PATHBTN, IDC_ICONBTN,
+                                   IDC_TYPE, IDC_LINKBTN };
+        StrId tips[7];
         static wchar_t tipbuf[3][512];
         int k;
         tips[0] = S_TIP_UAC; tips[1] = S_TIP_RECYCLE; tips[2] = S_TIP_AUTORESTORE;
-        tips[3] = S_TIP_BROWSE; tips[4] = S_TIP_BROWSE;
-        for (k = 0; k < 5; k++) {
+        tips[3] = S_TIP_BROWSE; tips[4] = S_TIP_BROWSE; tips[5] = S_LK_HINT; tips[6] = S_LK_BROWSE_PARENT;
+        for (k = 0; k < 7; k++) {
             TOOLINFOW ti;
             const wchar_t *text = T(tips[k]);
             if (k == 0 && !uac_available()) {
@@ -2242,12 +2336,19 @@ static void create_children(void)
                    LBS_NOINTEGRALHEIGHT, 0, IDC_LIST);
     SetWindowSubclass(s_list, list_proc, 1, 0);
 
+    s_lblType = child(L"STATIC", NULL, SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX, 0, IDC_L_TYPE);
+    s_type = child(L"COMBOBOX", NULL, WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, IDC_TYPE);
     s_lbl[0] = child(L"STATIC", NULL, SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX, 0, IDC_L_PATH);
     s_path = child(L"EDIT", NULL, WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, IDC_PATH);
     s_pathBtn = child(L"BUTTON", L"...", WS_TABSTOP | BS_PUSHBUTTON, 0, IDC_PATHBTN);
     s_lbl[1] = child(L"STATIC", NULL, SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX, 0, IDC_L_ICON);
     s_icon = child(L"EDIT", NULL, WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, IDC_ICONEDIT);
     s_iconBtn = child(L"BUTTON", L"...", WS_TABSTOP | BS_PUSHBUTTON, 0, IDC_ICONBTN);
+    s_linkEdit = child(L"EDIT", NULL, WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, IDC_LINKEDIT);
+    s_linkBtn = child(L"BUTTON", L"...", WS_TABSTOP | BS_PUSHBUTTON, 0, IDC_LINKBTN);
+    SendMessageW(s_linkEdit, EM_SETLIMITTEXT, PATHBUF - 1, 0);
+    ShowWindow(s_linkEdit, SW_HIDE);
+    ShowWindow(s_linkBtn, SW_HIDE);
     s_lbl[2] = child(L"STATIC", NULL, SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX, 0, IDC_L_DRIVE);
     s_letter = child(L"COMBOBOX", NULL, WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, IDC_LETTER);
     s_label = child(L"EDIT", NULL, WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, IDC_LABEL);
@@ -2572,6 +2673,16 @@ static void handle_command(int id, int code, HWND ctl)
         if ((g_set.flags & AF_BACKGROUND) || s_tempTray) show_main(FALSE);
         break;
     case IDC_PATHBTN: browse_folder(); break;
+    case IDC_LINKBTN: link_browse_parent(); break;
+    case IDC_PATH:
+        if (code == EN_CHANGE) type_follow_path();
+        break;
+    case IDC_LINKEDIT:
+        if (code == EN_CHANGE) link_field_changed();
+        break;
+    case IDC_TYPE:
+        if (code == CBN_SELCHANGE) set_editor_type(editor_type());
+        break;
     case IDC_ICONBTN: browse_icon(); break;
     case IDC_T_UAC:
     case IDC_T_RECYCLE:
@@ -2604,8 +2715,10 @@ static void handle_command(int id, int code, HWND ctl)
         rebuild_list();
         break;
     case IDM_LINK_NEW:
-        link_edit(-1);
-        after_action();
+        link_new();
+        break;
+    case IDM_LINK_SCAN:
+        link_scan();
         break;
     case IDM_ENABLEALL:  all_drives(0); break;
     case IDM_DISABLEALL: all_drives(1); break;
